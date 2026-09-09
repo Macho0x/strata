@@ -7,8 +7,8 @@ mod archive;
 mod create_entry;
 
 use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet},
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{OsStr, OsString},
     future::Future,
     io,
@@ -19,6 +19,12 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use gtk::{gio, glib, prelude::*};
@@ -1561,6 +1567,488 @@ async fn run_local_delete_step<T: Send + 'static>(
         .map_err(io_error)
 }
 
+#[derive(Clone)]
+struct LocalDeleteRoot {
+    parent: Arc<OwnedFd>,
+    name: OsString,
+    expected: Option<LocalFileIdentity>,
+}
+
+struct LocalDeleteGuard {
+    parent: Arc<OwnedFd>,
+    name: OsString,
+    handle: Arc<OwnedFd>,
+}
+
+enum LocalDeleteJob {
+    Entry {
+        parent: Arc<OwnedFd>,
+        name: OsString,
+        expected: Option<LocalFileIdentity>,
+        guard: Option<Arc<LocalDeleteGuard>>,
+        completion: Option<Arc<LocalDeleteGroup>>,
+    },
+    RemoveDirectory {
+        parent: Arc<OwnedFd>,
+        name: OsString,
+        handle: Arc<OwnedFd>,
+        completion: Option<Arc<LocalDeleteGroup>>,
+    },
+}
+
+struct LocalDeleteGroup {
+    remaining: AtomicUsize,
+    final_job: Mutex<Option<LocalDeleteJob>>,
+}
+
+struct LocalDeleteQueueState {
+    jobs: Vec<LocalDeleteJob>,
+    active: usize,
+}
+
+struct LocalDeleteQueue {
+    state: Mutex<LocalDeleteQueueState>,
+    wake: Condvar,
+    cancelled: Arc<AtomicBool>,
+    error: Mutex<Option<String>>,
+}
+
+impl LocalDeleteQueue {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            state: Mutex::new(LocalDeleteQueueState {
+                jobs: Vec::new(),
+                active: 0,
+            }),
+            wake: Condvar::new(),
+            cancelled,
+            error: Mutex::new(None),
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn enqueue(&self, job: LocalDeleteJob) {
+        if self.is_stopped() {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.is_stopped() {
+            return;
+        }
+        state.jobs.push(job);
+        self.wake.notify_one();
+    }
+
+    fn fail(&self, error: String) {
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let mut first_error = self
+            .error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if first_error.is_none() {
+            *first_error = Some(error);
+        }
+    }
+
+    fn next_job(&self) -> Option<LocalDeleteJob> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if self.is_stopped() {
+                return None;
+            }
+            if let Some(job) = state.jobs.pop() {
+                state.active += 1;
+                return Some(job);
+            }
+            if state.active == 0 {
+                return None;
+            }
+            state = self
+                .wake
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap_or_else(|poison| poison.into_inner())
+                .0;
+        }
+    }
+
+    fn finish_job(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 && state.jobs.is_empty() {
+            self.wake.notify_all();
+        }
+    }
+}
+
+fn complete_local_delete_job(
+    queue: &Arc<LocalDeleteQueue>,
+    completion: Option<Arc<LocalDeleteGroup>>,
+) {
+    let Some(group) = completion else {
+        return;
+    };
+    if group.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    let final_job = group
+        .final_job
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(final_job) = final_job {
+        queue.enqueue(final_job);
+    }
+}
+
+fn process_local_delete_job(queue: &Arc<LocalDeleteQueue>, job: LocalDeleteJob) {
+    match job {
+        LocalDeleteJob::Entry {
+            parent,
+            name,
+            expected,
+            guard,
+            completion,
+        } => {
+            if queue.is_stopped() {
+                return;
+            }
+            if let Some(guard) = guard
+                && let Err(error) = ensure_local_delete_target_unchanged(
+                    guard.parent.as_ref(),
+                    &guard.name,
+                    guard.handle.as_ref(),
+                )
+            {
+                queue.fail(error);
+                return;
+            }
+            let step = match open_local_delete_target(parent.as_ref(), &name, expected) {
+                Ok(step) => step,
+                Err(error) => {
+                    queue.fail(error);
+                    return;
+                }
+            };
+            match step {
+                LocalDeleteStep::Removed => complete_local_delete_job(queue, completion),
+                LocalDeleteStep::Directory { handle, children } => {
+                    let handle = Arc::new(handle);
+                    if children.is_empty() {
+                        remove_local_delete_directory(queue, parent, name, handle, completion);
+                        return;
+                    }
+                    let guard = Arc::new(LocalDeleteGuard {
+                        parent: parent.clone(),
+                        name: name.clone(),
+                        handle: handle.clone(),
+                    });
+                    let group = Arc::new(LocalDeleteGroup {
+                        remaining: AtomicUsize::new(children.len()),
+                        final_job: Mutex::new(Some(LocalDeleteJob::RemoveDirectory {
+                            parent: parent.clone(),
+                            name,
+                            handle: handle.clone(),
+                            completion,
+                        })),
+                    });
+                    for child in children {
+                        queue.enqueue(LocalDeleteJob::Entry {
+                            parent: handle.clone(),
+                            name: child,
+                            expected: None,
+                            guard: Some(guard.clone()),
+                            completion: Some(group.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        LocalDeleteJob::RemoveDirectory {
+            parent,
+            name,
+            handle,
+            completion,
+        } => remove_local_delete_directory(queue, parent, name, handle, completion),
+    }
+}
+
+fn remove_local_delete_directory(
+    queue: &Arc<LocalDeleteQueue>,
+    parent: Arc<OwnedFd>,
+    name: OsString,
+    handle: Arc<OwnedFd>,
+    completion: Option<Arc<LocalDeleteGroup>>,
+) {
+    if queue.is_stopped() {
+        return;
+    }
+    if let Err(error) =
+        ensure_local_delete_target_unchanged(parent.as_ref(), &name, handle.as_ref())
+    {
+        queue.fail(error);
+        return;
+    }
+    if let Err(error) = rustix::fs::unlinkat(parent.as_ref(), &name, rustix::fs::AtFlags::REMOVEDIR)
+    {
+        queue.fail(format!(
+            "Could not delete {}: {error}",
+            name.to_string_lossy()
+        ));
+        return;
+    }
+    complete_local_delete_job(queue, completion);
+}
+
+fn local_device_is_rotational(fd: &OwnedFd) -> Option<bool> {
+    let stat = rustix::fs::fstat(fd).ok()?;
+    let device = PathBuf::from("/sys/dev/block").join(format!(
+        "{}:{}",
+        rustix::fs::major(stat.st_dev),
+        rustix::fs::minor(stat.st_dev)
+    ));
+    let device = std::fs::canonicalize(device).ok()?;
+    rotational_sysfs_node(&device, &mut HashSet::new())
+}
+
+fn rotational_sysfs_node(path: &Path, visited: &mut HashSet<PathBuf>) -> Option<bool> {
+    let path = std::fs::canonicalize(path).ok()?;
+    if !visited.insert(path.clone()) {
+        return None;
+    }
+
+    let mut has_slave = false;
+    let mut unknown_slave = false;
+    if let Ok(slaves) = std::fs::read_dir(path.join("slaves")) {
+        for slave in slaves.flatten() {
+            has_slave = true;
+            match rotational_sysfs_node(&slave.path(), visited) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown_slave = true,
+            }
+        }
+    }
+    if has_slave {
+        return (!unknown_slave).then_some(false);
+    }
+
+    let mut current = Some(path.as_path());
+    while let Some(node) = current {
+        if let Ok(value) = std::fs::read_to_string(node.join("queue/rotational")) {
+            return match value.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn bounded_local_delete_worker_count(available: usize, rotational: bool) -> usize {
+    let available = available.max(1);
+    if rotational { 1 } else { available.min(2) }
+}
+
+fn local_delete_worker_count(roots: &[LocalDeleteRoot]) -> usize {
+    let available = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let rotational = roots
+        .iter()
+        .any(|root| local_device_is_rotational(root.parent.as_ref()) == Some(true));
+    bounded_local_delete_worker_count(available, rotational)
+}
+
+fn parallel_delete_local_blocking_with_workers(
+    roots: Vec<LocalDeleteRoot>,
+    cancelled: Arc<AtomicBool>,
+    worker_count: usize,
+) -> Result<(), String> {
+    let worker_count = worker_count.max(1);
+    let queue = Arc::new(LocalDeleteQueue::new(cancelled.clone()));
+    for root in roots {
+        queue.enqueue(LocalDeleteJob::Entry {
+            parent: root.parent,
+            name: root.name,
+            expected: root.expected,
+            guard: None,
+            completion: None,
+        });
+    }
+
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let queue = queue.clone();
+        workers.push(thread::spawn(move || {
+            let _priority = rustix::process::setpriority_process(None, 10);
+            while let Some(job) = queue.next_job() {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    process_local_delete_job(&queue, job);
+                }));
+                if result.is_err() {
+                    queue.fail("Delete worker panicked".to_owned());
+                }
+                queue.finish_job();
+            }
+        }));
+    }
+    for worker in workers {
+        if worker.join().is_err() {
+            queue.fail("Delete worker panicked".to_owned());
+        }
+    }
+
+    if cancelled.load(Ordering::Acquire) {
+        Err("Delete cancelled".to_owned())
+    } else if let Some(error) = queue
+        .error
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+    {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn parallel_delete_local_blocking(
+    roots: Vec<LocalDeleteRoot>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let worker_count = local_delete_worker_count(&roots);
+    parallel_delete_local_blocking_with_workers(roots, cancelled, worker_count)
+}
+
+fn parallel_delete_local(
+    roots: Vec<LocalDeleteRoot>,
+    cancellable: gio::Cancellable,
+) -> Pin<Box<dyn Future<Output = Result<(), glib::Error>>>> {
+    Box::pin(async move {
+        if roots.is_empty() {
+            return Ok(());
+        }
+        if cancellable.is_cancelled() {
+            return Err(cancelled_local_delete());
+        }
+        let cancelled = Arc::new(AtomicBool::new(cancellable.is_cancelled()));
+        let cancellation_flag = cancelled.clone();
+        let cancellation_handler = cancellable.connect_cancelled(move |_| {
+            cancellation_flag.store(true, Ordering::Release);
+        });
+        let result = gio::spawn_blocking(move || parallel_delete_local_blocking(roots, cancelled))
+            .await
+            .map_err(|_| io_error("Delete task panicked"))?;
+        if let Some(id) = cancellation_handler {
+            cancellable.disconnect_cancelled(id);
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error == "Delete cancelled" => Err(cancelled_local_delete()),
+            Err(error) => Err(io_error(error)),
+        }
+    })
+}
+
+struct BackgroundLocalDelete {
+    roots: Vec<LocalDeleteRoot>,
+    cancellable: gio::Cancellable,
+}
+
+#[derive(Default)]
+struct BackgroundDeleteManager {
+    running: bool,
+    active: Option<gio::Cancellable>,
+    pending: VecDeque<BackgroundLocalDelete>,
+}
+
+thread_local! {
+    static BACKGROUND_DELETE_MANAGER: RefCell<BackgroundDeleteManager> =
+        RefCell::new(BackgroundDeleteManager::default());
+}
+
+async fn run_background_delete_manager() {
+    loop {
+        let next = BACKGROUND_DELETE_MANAGER.with(|manager| {
+            let mut manager = manager.borrow_mut();
+            let Some(next) = manager.pending.pop_front() else {
+                manager.active = None;
+                manager.running = false;
+                return None;
+            };
+            manager.active = Some(next.cancellable.clone());
+            Some(next)
+        });
+        let Some(next) = next else {
+            return;
+        };
+        let result = parallel_delete_local(next.roots, next.cancellable).await;
+        BACKGROUND_DELETE_MANAGER.with(|manager| {
+            manager.borrow_mut().active = None;
+        });
+        if let Err(error) = result
+            && !was_cancelled(&error)
+        {
+            tracing::warn!(%error, "background delete cleanup did not complete");
+        }
+    }
+}
+
+fn start_background_local_delete(roots: Vec<LocalDeleteRoot>) {
+    if roots.is_empty() {
+        return;
+    }
+    let should_start = BACKGROUND_DELETE_MANAGER.with(|manager| {
+        let mut manager = manager.borrow_mut();
+        manager.pending.push_back(BackgroundLocalDelete {
+            roots,
+            cancellable: gio::Cancellable::new(),
+        });
+        if manager.running {
+            false
+        } else {
+            manager.running = true;
+            true
+        }
+    });
+    if should_start {
+        let _task = glib::MainContext::default().spawn_local(run_background_delete_manager());
+    }
+}
+
+pub(crate) fn cancel_background_deletions() {
+    BACKGROUND_DELETE_MANAGER.with(|manager| {
+        let manager = manager.borrow();
+        if let Some(cancellable) = &manager.active {
+            cancellable.cancel();
+        }
+        for pending in &manager.pending {
+            pending.cancellable.cancel();
+        }
+    });
+}
+
+#[cfg(test)]
+fn background_local_delete_is_active() -> bool {
+    BACKGROUND_DELETE_MANAGER.with(|manager| manager.borrow().running)
+}
+
 /// Recursively and permanently deletes the entry named `name` inside
 /// `parent`, walking descriptor-relative to each already-open directory
 /// rather than re-resolving paths, so a component swapped out from under an
@@ -1571,43 +2059,76 @@ fn permanently_delete_local(
     expected: Option<LocalFileIdentity>,
     cancellable: gio::Cancellable,
 ) -> Pin<Box<dyn Future<Output = Result<(), glib::Error>>>> {
+    parallel_delete_local(
+        vec![LocalDeleteRoot {
+            parent: Arc::new(parent),
+            name,
+            expected,
+        }],
+        cancellable,
+    )
+}
+
+/// Atomically hides a local delete target in its already-open parent. The
+/// returned descriptor and staged name are the only handles the cleanup walk
+/// uses; it never resolves the original path again.
+fn stage_local_delete_path_if_unchanged(
+    path: PathBuf,
+    expected: Option<LocalFileIdentity>,
+    cancellable: gio::Cancellable,
+) -> Pin<Box<dyn Future<Output = Result<LocalDeleteRoot, glib::Error>>>> {
     Box::pin(async move {
         if cancellable.is_cancelled() {
             return Err(cancelled_local_delete());
         }
-        let step_parent = parent.try_clone().map_err(io_error)?;
-        let step_name = name.clone();
-        let step = run_local_delete_step(move || {
-            open_local_delete_target(&step_parent, &step_name, expected)
-        })
-        .await?;
-        let LocalDeleteStep::Directory { handle, children } = step else {
-            return Ok(());
+        let Some(parent_path) = path.parent().map(Path::to_path_buf) else {
+            return Err(io_error("Cannot permanently delete the filesystem root"));
         };
-        for child in children {
-            if cancellable.is_cancelled() {
-                return Err(cancelled_local_delete());
-            }
-            let checked_parent = parent.try_clone().map_err(io_error)?;
-            let checked_handle = handle.try_clone().map_err(io_error)?;
-            let checked_name = name.clone();
-            run_local_delete_step(move || {
-                ensure_local_delete_target_unchanged(
-                    &checked_parent,
-                    &checked_name,
-                    &checked_handle,
-                )
-            })
-            .await?;
-            let child_parent = handle.try_clone().map_err(io_error)?;
-            permanently_delete_local(child_parent, child, None, cancellable.clone()).await?;
-        }
+        let Some(name) = path.file_name().map(OsStr::to_os_string) else {
+            return Err(io_error("Invalid delete target"));
+        };
+        let parent =
+            run_local_delete_step(move || open_local_parent_directory(&parent_path)).await?;
         run_local_delete_step(move || {
-            ensure_local_delete_target_unchanged(&parent, &name, &handle)?;
-            rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::REMOVEDIR)
-                .map_err(|error| format!("Could not delete {}: {error}", name.to_string_lossy()))
+            let stat = rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| {
+                    format!("Could not inspect {}: {error}", name.to_string_lossy())
+                })?;
+            ensure_expected_local_identity(&name, &stat, expected)?;
+            let identity = LocalFileIdentity::from_stat(&stat);
+            for _ in 0..3 {
+                let staged_name =
+                    OsString::from(format!(".strata-trash-{}", glib::uuid_string_random()));
+                match rustix::fs::renameat_with(
+                    &parent,
+                    &name,
+                    &parent,
+                    &staged_name,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {
+                        return Ok(LocalDeleteRoot {
+                            parent: Arc::new(parent),
+                            name: staged_name,
+                            expected: Some(identity),
+                        });
+                    }
+                    Err(rustix::io::Errno::EXIST) => continue,
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not stage {} for deletion: {error}",
+                            name.to_string_lossy()
+                        ));
+                    }
+                }
+            }
+            Err(format!(
+                "Could not find a staging name for {}",
+                name.to_string_lossy()
+            ))
         })
         .await
+        .map_err(io_error)
     })
 }
 
@@ -2023,6 +2544,7 @@ async fn run_deletion(
         affected_locations.insert(Location::uri("trash:///"));
     }
     let total = targets.len();
+    let mut local_delete_roots = Vec::new();
     for (index, target) in targets.iter().enumerate() {
         if cancellable.is_cancelled() {
             emit(cancelled_event(
@@ -2050,6 +2572,12 @@ async fn run_deletion(
                     });
                 })
                 .await
+            } else if let Some(path) = target.location.native_path() {
+                stage_local_delete_path_if_unchanged(path.to_path_buf(), None, cancellable.clone())
+                    .await
+                    .map(|root| {
+                        local_delete_roots.push(root);
+                    })
             } else {
                 permanently_delete_maybe_local(file, target.is_directory, cancellable.clone()).await
             }
@@ -2096,6 +2624,19 @@ async fn run_deletion(
             total,
             deleted_location,
         });
+    }
+    if !local_delete_roots.is_empty() {
+        if cancellable.is_cancelled() {
+            emit(cancelled_event(
+                request_id,
+                deleted_locations,
+                failed_locations,
+                Vec::new(),
+                affected_locations,
+            ));
+            return;
+        }
+        start_background_local_delete(local_delete_roots);
     }
     if errors.is_empty() {
         emit(OperationEvent::Deleted {

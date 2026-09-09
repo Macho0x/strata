@@ -120,6 +120,7 @@ fn main() -> gtk::glib::ExitCode {
         .build();
 
     application.connect_startup(export_file_manager_interface);
+    application.connect_shutdown(|_| adapters::cancel_background_deletions());
     application.connect_activate(ui::present);
     application.connect_open(|application, files, _| {
         let locations = open_locations(files);

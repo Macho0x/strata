@@ -6,10 +6,18 @@ use std::{
     error::Error,
     ffi::{OsStr, OsString},
     fs,
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    future::Future,
+    io,
+    os::{
+        fd::OwnedFd,
+        unix::{ffi::OsStringExt, fs::PermissionsExt},
+    },
     path::{Path, PathBuf},
+    pin::Pin,
     rc::Rc,
-    time::{Duration, SystemTime},
+    sync::{Arc, atomic::AtomicBool},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use gtk::{gio, glib, prelude::*};
@@ -62,6 +70,20 @@ fn settle_cancelled_io(context: &glib::MainContext) {
     while context.pending() {
         context.iteration(false);
     }
+}
+
+fn settle_background_deletes(context: &glib::MainContext) {
+    while super::background_local_delete_is_active() {
+        context.iteration(true);
+    }
+}
+
+#[test]
+fn rotational_deletes_cap_parallelism_without_disabling_it() {
+    assert_eq!(super::bounded_local_delete_worker_count(0, false), 1);
+    assert_eq!(super::bounded_local_delete_worker_count(1, true), 1);
+    assert_eq!(super::bounded_local_delete_worker_count(8, true), 1);
+    assert_eq!(super::bounded_local_delete_worker_count(8, false), 2);
 }
 
 #[test]
@@ -1261,6 +1283,7 @@ fn permanent_delete_removes_a_symlink_standing_in_for_a_directory_without_follow
     {
         context.iteration(true);
     }
+    settle_background_deletes(&context);
 
     assert!(
         sentinel.exists(),
@@ -1310,6 +1333,7 @@ fn permanent_delete_does_not_follow_a_symlink_nested_inside_the_tree() -> Result
     {
         context.iteration(true);
     }
+    settle_background_deletes(&context);
 
     assert!(
         sentinel.exists(),
@@ -1356,6 +1380,7 @@ fn permanent_delete_accepts_a_symlink_in_the_parent_path() -> Result<(), Box<dyn
     }) {
         context.iteration(true);
     }
+    settle_background_deletes(&context);
 
     assert!(
         events
@@ -1570,7 +1595,103 @@ fn copying_and_replacing_symlinks_accepts_an_aliased_destination() -> Result<(),
 }
 
 #[test]
-fn permanent_delete_stops_if_an_open_directory_is_moved() -> Result<(), Box<dyn Error>> {
+fn staging_a_local_delete_hides_the_original_before_cleanup() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("target");
+    fs::create_dir(&target)?;
+    fs::write(target.join("item.txt"), b"contents")?;
+
+    let context = glib::MainContext::default();
+    let staged = context.block_on(super::stage_local_delete_path_if_unchanged(
+        target.clone(),
+        None,
+        gio::Cancellable::new(),
+    ))?;
+
+    assert!(!target.exists());
+    assert!(root.path().join(&staged.name).exists());
+    context.block_on(super::parallel_delete_local(
+        vec![staged],
+        gio::Cancellable::new(),
+    ))?;
+    assert_eq!(fs::read_dir(root.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn permanent_delete_finishes_before_background_cleanup() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("target");
+    fs::create_dir(&target)?;
+    fs::write(target.join("item.txt"), b"contents")?;
+    let detached = Rc::new(Cell::new(false));
+    let detached_on_event = detached.clone();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let emitted = events.clone();
+
+    let _operation = LocalOperationProvider.delete(
+        DeleteRequest {
+            id: OperationRequestId(26),
+            entries: vec![directory_entry(&target)],
+            permanent: true,
+        },
+        Rc::new(move |event| {
+            if matches!(event, OperationEvent::Deleted { .. }) {
+                detached_on_event.set(super::background_local_delete_is_active());
+            }
+            emitted.borrow_mut().push(event);
+        }),
+    );
+    let context = glib::MainContext::default();
+    while !events
+        .borrow()
+        .iter()
+        .any(|event| matches!(event, OperationEvent::Deleted { .. }))
+    {
+        context.iteration(true);
+    }
+
+    assert!(detached.get());
+    assert!(!target.exists());
+    settle_background_deletes(&context);
+    assert_eq!(fs::read_dir(root.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn background_cleanup_can_be_cancelled() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("target");
+    fs::create_dir(&target)?;
+    fs::write(target.join("item.txt"), b"contents")?;
+    let context = glib::MainContext::default();
+    let staged = context.block_on(super::stage_local_delete_path_if_unchanged(
+        target,
+        None,
+        gio::Cancellable::new(),
+    ))?;
+    let staged_path = root.path().join(&staged.name);
+
+    super::start_background_local_delete(vec![staged]);
+    super::cancel_background_deletions();
+    settle_background_deletes(&context);
+
+    assert!(staged_path.exists());
+    fs::remove_dir_all(staged_path)?;
+    Ok(())
+}
+
+#[test]
+fn permanent_delete_stops_if_a_staged_directory_is_moved() -> Result<(), Box<dyn Error>> {
     let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
         .map_err(|error| error.to_string())?;
@@ -1582,42 +1703,73 @@ fn permanent_delete_stops_if_an_open_directory_is_moved() -> Result<(), Box<dyn 
         fs::write(target.join(format!("item-{index}.txt")), b"keep")?;
     }
 
-    let events = Rc::new(RefCell::new(Vec::new()));
-    let emitted = events.clone();
-    let _operation = LocalOperationProvider.delete(
-        DeleteRequest {
-            id: OperationRequestId(23),
-            entries: vec![directory_entry(&target)],
-            permanent: true,
-        },
-        Rc::new(move |event| emitted.borrow_mut().push(event)),
-    );
     let context = glib::MainContext::default();
-    while fs::read_dir(&target)?.count() == 64 {
-        context.iteration(true);
-    }
-    fs::rename(&target, &moved)?;
-    while !events
-        .borrow()
-        .iter()
-        .any(|event| matches!(event, OperationEvent::CompletedWithErrors { .. }))
-    {
-        context.iteration(true);
-    }
+    let staged = context.block_on(super::stage_local_delete_path_if_unchanged(
+        target,
+        None,
+        gio::Cancellable::new(),
+    ))?;
+    let staged_path = root.path().join(&staged.name);
+    fs::rename(staged_path, &moved)?;
+    let error = context
+        .block_on(super::parallel_delete_local(
+            vec![staged],
+            gio::Cancellable::new(),
+        ))
+        .expect_err("moving the staged directory must stop cleanup");
 
+    assert!(
+        error.to_string().contains("Could not inspect") || error.to_string().contains("changed")
+    );
     assert!(fs::read_dir(&moved)?.next().is_some());
     Ok(())
 }
 
 #[test]
-fn cancelling_recursive_delete_leaves_the_unfinished_root_in_place() -> Result<(), Box<dyn Error>> {
+fn a_failed_staged_root_does_not_stop_other_cleanup() -> Result<(), Box<dyn Error>> {
     let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
         .map_err(|error| error.to_string())?;
-    let unique = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("strata-recursive-delete-cancel-test-{unique}"));
+    let root = tempfile::tempdir()?;
+    let failed = root.path().join("failed");
+    let moved = root.path().join("moved");
+    let successful = root.path().join("successful");
+    fs::create_dir(&failed)?;
+    fs::write(failed.join("keep.txt"), b"keep")?;
+    fs::create_dir(&successful)?;
+    fs::write(successful.join("delete.txt"), b"delete")?;
+    let context = glib::MainContext::default();
+    let failed = context.block_on(super::stage_local_delete_path_if_unchanged(
+        failed,
+        None,
+        gio::Cancellable::new(),
+    ))?;
+    let successful = context.block_on(super::stage_local_delete_path_if_unchanged(
+        successful,
+        None,
+        gio::Cancellable::new(),
+    ))?;
+    let successful_stage = root.path().join(&successful.name);
+    fs::rename(root.path().join(&failed.name), &moved)?;
+
+    let result = context.block_on(super::parallel_delete_local(
+        vec![failed, successful],
+        gio::Cancellable::new(),
+    ));
+
+    assert!(result.is_err());
+    assert!(!successful_stage.exists());
+    assert_eq!(fs::read(moved.join("keep.txt"))?, b"keep");
+    Ok(())
+}
+
+#[test]
+fn cancelling_recursive_delete_leaves_the_staged_root_for_cleanup() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let parent = tempfile::tempdir()?;
+    let root = parent.path().join("target");
     let nested = root.join("nested");
     fs::create_dir_all(&nested)?;
     for index in 0..4 {
@@ -1625,20 +1777,25 @@ fn cancelling_recursive_delete_leaves_the_unfinished_root_in_place() -> Result<(
     }
 
     let events = Rc::new(RefCell::new(Vec::new()));
+    let operation = Rc::new(RefCell::new(None::<LoadHandle>));
     let emitted = events.clone();
-    let operation = LocalOperationProvider.delete(
+    let operation_for_emit = operation.clone();
+    let handle = LocalOperationProvider.delete(
         DeleteRequest {
             id: OperationRequestId(10),
             entries: vec![directory_entry(&root)],
             permanent: true,
         },
-        Rc::new(move |event| emitted.borrow_mut().push(event)),
+        Rc::new(move |event| {
+            let cancel = matches!(event, OperationEvent::DeleteProgress { completed: 1, .. });
+            emitted.borrow_mut().push(event);
+            if cancel {
+                operation_for_emit.borrow_mut().take();
+            }
+        }),
     );
+    operation.replace(Some(handle));
     let context = glib::MainContext::default();
-    while fs::read_dir(&nested)?.count() == 4 {
-        context.iteration(true);
-    }
-    drop(operation);
     while !events
         .borrow()
         .iter()
@@ -1656,15 +1813,247 @@ fn cancelling_recursive_delete_leaves_the_unfinished_root_in_place() -> Result<(
             _ => None,
         })
         .expect("terminal cancellation result");
-    assert!(result.failed == [Location::local(&root)]);
+    assert_eq!(result.completed, [Location::local(&root)]);
+    assert!(result.failed.is_empty());
     assert!(result.affected_locations.contains(&Location::local(&root)));
-    assert!(
-        !result
-            .affected_locations
-            .contains(&Location::local(&nested))
+    assert!(!root.exists());
+    let staged = fs::read_dir(parent.path())?
+        .flatten()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".strata-trash-")
+        })
+        .map(|entry| entry.path())
+        .expect("cancellation keeps the staged root for later cleanup");
+    fs::remove_dir_all(staged)?;
+    Ok(())
+}
+
+fn sequential_delete_local(
+    parent: OwnedFd,
+    name: OsString,
+) -> Pin<Box<dyn Future<Output = Result<(), glib::Error>>>> {
+    Box::pin(async move {
+        let step_parent = parent.try_clone().map_err(super::io_error)?;
+        let step_name = name.clone();
+        let step = super::run_local_delete_step(move || {
+            super::open_local_delete_target(&step_parent, &step_name, None)
+        })
+        .await?;
+        let super::LocalDeleteStep::Directory { handle, children } = step else {
+            return Ok(());
+        };
+        for child in children {
+            let checked_parent = parent.try_clone().map_err(super::io_error)?;
+            let checked_handle = handle.try_clone().map_err(super::io_error)?;
+            let checked_name = name.clone();
+            super::run_local_delete_step(move || {
+                super::ensure_local_delete_target_unchanged(
+                    &checked_parent,
+                    &checked_name,
+                    &checked_handle,
+                )
+            })
+            .await?;
+            sequential_delete_local(handle.try_clone().map_err(super::io_error)?, child).await?;
+        }
+        super::run_local_delete_step(move || {
+            super::ensure_local_delete_target_unchanged(&parent, &name, &handle)?;
+            rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(|error| error.to_string())
+        })
+        .await
+    })
+}
+
+fn sync_delete_benchmark_filesystem(root: &Path) -> Result<(), Box<dyn Error>> {
+    let handle = rustix::fs::open(
+        root,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    rustix::fs::syncfs(handle)?;
+    Ok(())
+}
+
+fn create_delete_benchmark_tree(root: &Path, count: usize) -> io::Result<()> {
+    const DIRECTORIES: usize = 256;
+    fs::create_dir(root)?;
+    for directory in 0..DIRECTORIES.min(count.max(1)) {
+        fs::create_dir(root.join(format!("dir-{directory}")))?;
+    }
+    for index in 0..count {
+        fs::File::create(
+            root.join(format!("dir-{}", index % DIRECTORIES))
+                .join(format!("item-{index}")),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual performance benchmark; run scripts/benchmark-delete.sh"]
+fn benchmark_delete_large_directory() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let count = std::env::var("STRATA_DELETE_BENCH_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100_000);
+    let benchmark_root = std::env::var_os("STRATA_DELETE_BENCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?.join("target/delete-benchmark"));
+    fs::create_dir_all(&benchmark_root)?;
+    let serial_root = benchmark_root.join(format!("serial-{unique}"));
+    let available_workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1);
+    let mut worker_counts = vec![1, 2, 4, available_workers];
+    worker_counts.sort_unstable();
+    worker_counts.dedup();
+    worker_counts.retain(|workers| *workers <= available_workers);
+    let worker_roots = worker_counts
+        .iter()
+        .map(|workers| {
+            (
+                *workers,
+                benchmark_root.join(format!("workers-{workers}-{unique}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    create_delete_benchmark_tree(&serial_root, count)?;
+    for (_, root) in &worker_roots {
+        create_delete_benchmark_tree(root, count)?;
+    }
+    sync_delete_benchmark_filesystem(&benchmark_root)?;
+    let context = glib::MainContext::default();
+
+    let serial_parent = super::open_local_parent_directory(
+        serial_root.parent().ok_or("benchmark root has no parent")?,
+    )?;
+    let serial_name = serial_root
+        .file_name()
+        .ok_or("benchmark root has no name")?
+        .to_owned();
+    let serial_started = Instant::now();
+    context.block_on(sequential_delete_local(serial_parent, serial_name))?;
+    let serial_elapsed = serial_started.elapsed();
+    sync_delete_benchmark_filesystem(&benchmark_root)?;
+
+    let mut measurements = Vec::new();
+    let mut detected_workers = None;
+    for (workers, root) in &worker_roots {
+        let poof_started = Instant::now();
+        let staged = context.block_on(super::stage_local_delete_path_if_unchanged(
+            root.clone(),
+            None,
+            gio::Cancellable::new(),
+        ))?;
+        let poof_elapsed = poof_started.elapsed();
+        detected_workers = Some(super::local_delete_worker_count(std::slice::from_ref(
+            &staged,
+        )));
+        let cleanup_started = Instant::now();
+        super::parallel_delete_local_blocking_with_workers(
+            vec![staged],
+            Arc::new(AtomicBool::new(false)),
+            *workers,
+        )
+        .map_err(io::Error::other)?;
+        let cleanup_elapsed = cleanup_started.elapsed();
+        measurements.push((*workers, poof_elapsed, cleanup_elapsed));
+        sync_delete_benchmark_filesystem(&benchmark_root)?;
+    }
+    let production_workers = detected_workers.unwrap_or(1);
+    let (_, production_poof, production_cleanup) = measurements
+        .iter()
+        .find(|measurement| measurement.0 == production_workers)
+        .copied()
+        .ok_or("missing production worker measurement")?;
+    let single_cleanup = measurements
+        .iter()
+        .find(|measurement| measurement.0 == 1)
+        .map(|measurement| measurement.2)
+        .ok_or("missing single-worker measurement")?;
+    let production_elapsed = production_poof + production_cleanup;
+
+    println!("files: {count}; production workers: {production_workers}");
+    println!(
+        "legacy sequential: {:.3}s ({:.0} files/s)",
+        serial_elapsed.as_secs_f64(),
+        count as f64 / serial_elapsed.as_secs_f64().max(f64::EPSILON)
     );
-    assert!(root.exists());
-    fs::remove_dir_all(root)?;
+    for (workers, poof, cleanup) in &measurements {
+        println!(
+            "workers={workers}: poof={:.6}s cleanup={:.3}s ({:.0} files/s)",
+            poof.as_secs_f64(),
+            cleanup.as_secs_f64(),
+            count as f64 / cleanup.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+    println!(
+        "production parallel speedup: {:.2}x; end-to-end speedup: {:.2}x",
+        single_cleanup.as_secs_f64() / production_elapsed.as_secs_f64().max(f64::EPSILON),
+        serial_elapsed.as_secs_f64() / production_elapsed.as_secs_f64().max(f64::EPSILON)
+    );
+    assert!(!serial_root.exists());
+    assert!(worker_roots.iter().all(|(_, root)| !root.exists()));
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual scale benchmark; run STRATA_DELETE_BENCH_SCALE=1 scripts/benchmark-delete.sh"]
+fn benchmark_parallel_delete_scale() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let count = std::env::var("STRATA_DELETE_BENCH_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000_000);
+    let benchmark_root = std::env::var_os("STRATA_DELETE_BENCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?.join("target/delete-benchmark"));
+    fs::create_dir_all(&benchmark_root)?;
+    let root = benchmark_root.join(format!("scale-{unique}"));
+    create_delete_benchmark_tree(&root, count)?;
+    sync_delete_benchmark_filesystem(&benchmark_root)?;
+    let context = glib::MainContext::default();
+
+    let poof_started = Instant::now();
+    let staged = context.block_on(super::stage_local_delete_path_if_unchanged(
+        root.clone(),
+        None,
+        gio::Cancellable::new(),
+    ))?;
+    let poof_elapsed = poof_started.elapsed();
+    let workers = super::local_delete_worker_count(std::slice::from_ref(&staged));
+    let cleanup_started = Instant::now();
+    super::parallel_delete_local_blocking_with_workers(
+        vec![staged],
+        Arc::new(AtomicBool::new(false)),
+        workers,
+    )
+    .map_err(io::Error::other)?;
+    let cleanup_elapsed = cleanup_started.elapsed();
+
+    println!(
+        "files={count} workers={workers} poof={:.6}s cleanup={:.3}s ({:.0} files/s)",
+        poof_elapsed.as_secs_f64(),
+        cleanup_elapsed.as_secs_f64(),
+        count as f64 / cleanup_elapsed.as_secs_f64().max(f64::EPSILON)
+    );
+    assert!(!root.exists());
     Ok(())
 }
 
