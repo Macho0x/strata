@@ -1,4 +1,5 @@
 /target
+/packaging/math-renderer/node_modules/
 *.swp
 *.swo
 .idea/
@@ -20,3 +21,8 @@ packaging/aur/*/*.pkg.tar.zst
 # Restored coding-agent skills (see skills-lock.json)
 /.agents/
 /.grok/
+
+# Historical PR capture locations; upload review media to GitHub instead.
+/docs/evidence/
+/docs/screenshots/
+/docs/images/

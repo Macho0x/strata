@@ -105,17 +105,17 @@ pub(crate) fn plan_restore_from_known_paths(
     if !destination.starts_with(&allowed_root) {
         return Err(escaped_restore_error());
     }
-    if context.mounts.mount_point_for(&destination) != Some(allowed_root.as_path()) {
-        return Err(RestoreTargetError::new(
-            "The original location crosses a bind mount or subvolume boundary and cannot be restored",
-        ));
-    }
     if restore_volume_relation(
         &Location::local(source_path),
         &Location::local(&destination),
     ) != VolumeRelation::Same
     {
         return Err(escaped_restore_error());
+    }
+    if context.mounts.mount_point_for(&destination) != Some(allowed_root.as_path()) {
+        return Err(RestoreTargetError::new(
+            "The original location crosses a bind mount or subvolume boundary and cannot be restored",
+        ));
     }
     let trash_tree = trash_tree_root(trash_root);
     if path_is_within(&destination, &trash_tree) {
@@ -129,6 +129,11 @@ pub(crate) fn plan_restore_from_known_paths(
     if path_is_within(&destination, &trash_tree) {
         return Err(RestoreTargetError::new(
             "The original location must not be inside the trash directory",
+        ));
+    }
+    if !destination.parent().map(Path::is_dir).unwrap_or(false) {
+        return Err(RestoreTargetError::new(
+            "The original location's parent folder no longer exists",
         ));
     }
     Ok(RestorePlan {
@@ -636,6 +641,9 @@ fn canonical_restore_destination(path: &Path) -> Result<PathBuf, RestoreTargetEr
     let parent = path
         .parent()
         .ok_or_else(|| RestoreTargetError::new("The original location is invalid"))?;
+    if std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(symlinked_parent_error());
+    }
     let mut existing = parent.to_path_buf();
     let mut missing = Vec::new();
     while !existing.as_os_str().is_empty() && !existing.exists() {
@@ -673,4 +681,8 @@ fn escaped_restore_error() -> RestoreTargetError {
     RestoreTargetError::new(
         "The original location is outside the trash volume and cannot be restored.",
     )
+}
+
+fn symlinked_parent_error() -> RestoreTargetError {
+    RestoreTargetError::new("The original location's parent is a symlink and cannot be restored.")
 }

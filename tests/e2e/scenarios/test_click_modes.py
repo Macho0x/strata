@@ -42,9 +42,8 @@ def test_keyboard_open_selects_the_first_child(strata, mode):
 
 
 @SINGLE_CLICK
-@pytest.mark.parametrize("mode", ALL_MODES)
 @pytest.mark.parametrize("activation", ["mouse", "keyboard"])
-def test_sidebar_selection_depends_on_activation(strata, mode, activation):
+def test_sidebar_selection_depends_on_activation(strata, activation):
     home = strata.environment.home
     (home / "child").mkdir()
     if activation == "mouse":
@@ -147,7 +146,7 @@ def _choose_single_click(strata) -> None:
     strata.pointer.click(strata.header_button("Settings"))
     option = strata.wait(
         lambda: strata.window.find(
-            role="toggle button", name="List Folders 1 click", rendered=False
+            role="toggle button", name="List view Folders Single", rendered=False
         ),
         "the List single-click option in Settings",
     )
@@ -160,7 +159,7 @@ def _choose_single_click(strata) -> None:
     strata.keyboard.press("Escape")
     strata.wait(
         lambda: strata.window.find(
-            role="toggle button", name="List Folders 1 click"
+            role="toggle button", name="List view Folders Single"
         )
         is None,
         "Settings to close",

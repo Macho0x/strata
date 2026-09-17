@@ -99,8 +99,8 @@ impl ViewState {
             return;
         }
         match commit {
-            DropCommit::Copy => self.start_transfer(destination, sources, false),
-            DropCommit::Move => self.start_transfer(destination, sources, true),
+            DropCommit::Copy => self.start_drop_transfer(destination, sources, false),
+            DropCommit::Move => self.start_drop_transfer(destination, sources, true),
             DropCommit::Ask { volume, .. } => {
                 self.confirm_cross_volume_drop(destination, sources, volume);
             }
@@ -178,7 +178,7 @@ impl ViewState {
             let chosen_sources = sources.clone();
             button.connect_clicked(move |_| {
                 dismiss_modal_layer(&chosen_layer, &chosen_overlay, chosen_root.as_ref());
-                chosen_state.start_transfer(
+                chosen_state.start_drop_transfer(
                     chosen_destination.clone(),
                     chosen_sources.clone(),
                     move_sources,
@@ -209,7 +209,30 @@ impl ViewState {
         sources: Vec<Location>,
         move_sources: bool,
     ) {
+        self.start_transfer_with_reveal(destination, sources, move_sources, true);
+    }
+
+    fn start_drop_transfer(
+        self: &Rc<Self>,
+        destination: Location,
+        sources: Vec<Location>,
+        move_sources: bool,
+    ) {
+        let reveal = crate::ui::theme::ThemeManager::shared().open_folder_after_drop();
+        self.start_transfer_with_reveal(destination, sources, move_sources, reveal);
+    }
+
+    /// Paste and explicit "move/copy to" reveal their result independently of
+    /// the drop preference, which is captured when the transfer starts.
+    pub(super) fn start_transfer_with_reveal(
+        self: &Rc<Self>,
+        destination: Location,
+        sources: Vec<Location>,
+        move_sources: bool,
+        reveal: bool,
+    ) {
         if is_trash_location(&destination)
+            || destination.is_recent_location()
             || (move_sources && sources.iter().any(|source| !can_remove_location(source)))
         {
             return;
@@ -233,7 +256,7 @@ impl ViewState {
                 });
             }
         }
-        self.resolve_transfer_collisions(destination, collisions, accepted, move_sources);
+        self.resolve_transfer_collisions(destination, collisions, accepted, move_sources, reveal);
     }
 
     fn resolve_transfer_collisions(
@@ -242,9 +265,11 @@ impl ViewState {
         mut collisions: Vec<Location>,
         accepted: Vec<PasteItem>,
         move_sources: bool,
+        reveal: bool,
     ) {
         if collisions.is_empty() {
-            self.browser.transfer(destination, accepted, move_sources);
+            self.browser
+                .transfer(destination, accepted, move_sources, reveal);
             return;
         }
         let source = collisions.remove(0);
@@ -255,10 +280,13 @@ impl ViewState {
         );
         let state = self.clone();
         // Move undo/reveal assumes an unrenamed `transfer_target`.
+        let apply_to_all_visible = !collisions.is_empty();
+        let skip_visible = !accepted.is_empty() || !collisions.is_empty();
         self.confirm_replace_conflict(
             &name,
             &explanation,
-            !collisions.is_empty(),
+            apply_to_all_visible,
+            skip_visible,
             !move_sources,
             Rc::new(move |choice, apply_to_all| {
                 let mut accepted = accepted.clone();
@@ -296,6 +324,7 @@ impl ViewState {
                     remaining,
                     accepted,
                     move_sources,
+                    reveal,
                 );
             }),
         );
@@ -364,10 +393,13 @@ impl ViewState {
             compact_display_path(&parent)
         );
         let state = self.clone();
+        let apply_to_all_visible = !collisions.is_empty();
+        let skip_visible = !accepted.is_empty() || !collisions.is_empty();
         self.confirm_replace_conflict(
             &name,
             &explanation,
-            !collisions.is_empty(),
+            apply_to_all_visible,
+            skip_visible,
             false,
             Rc::new(move |choice, apply_to_all| {
                 let mut accepted = accepted.clone();
@@ -398,10 +430,11 @@ impl ViewState {
 
     /// Cancelling abandons the whole operation without calling `on_choice`.
     fn confirm_replace_conflict(
-        &self,
+        self: &Rc<Self>,
         name: &str,
         explanation: &str,
-        has_more_conflicts: bool,
+        apply_to_all_visible: bool,
+        skip_visible: bool,
         allow_keep_both: bool,
         on_choice: Rc<dyn Fn(ConflictChoice, bool)>,
     ) {
@@ -421,11 +454,12 @@ impl ViewState {
             ModalTone::Danger,
         );
         layout.body.append(&message_dialog_description(explanation));
-        let apply_all = form_check_button("Apply this choice to all remaining conflicts");
-        apply_all.set_visible(has_more_conflicts);
-        layout.body.append(&apply_all);
+        let apply_all = form_check_button("Apply to All");
+        apply_all.set_visible(apply_to_all_visible);
+        layout.actions.prepend(&apply_all);
         let skip = gtk::Button::with_label("Skip");
         skip.add_css_class("action-dialog-cancel");
+        skip.set_visible(skip_visible);
         layout
             .actions
             .insert_child_after(&skip, Some(&layout.cancel));
@@ -439,6 +473,14 @@ impl ViewState {
 
         let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
         window_overlay.add_overlay(&layer);
+        let browser = Rc::downgrade(&self.browser);
+        layer.connect_parent_notify(move |layer| {
+            if layer.parent().is_none()
+                && let Some(browser) = browser.upgrade()
+            {
+                browser.focus_active();
+            }
+        });
         let cancel_layer = layer.clone();
         let cancel_overlay = window_overlay.clone();
         let cancel_root = blurred_root.clone();

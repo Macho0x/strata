@@ -6,6 +6,65 @@ use gtk::gio;
 use std::path::Path;
 
 #[test]
+fn pasted_images_preserve_collisions_and_dangling_symlinks() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let target = dir.path().join("missing.png");
+    std::os::unix::fs::symlink(&target, dir.path().join("image.png")).expect("dangling symlink");
+    std::fs::create_dir(dir.path().join("image (1).png")).expect("existing directory");
+    std::fs::write(dir.path().join("image (2).png"), b"original").expect("existing image");
+
+    let path = write_pasted_image(dir.path(), b"pasted").expect("paste image");
+
+    assert_eq!(path, dir.path().join("image (3).png"));
+    assert_eq!(std::fs::read(path).expect("pasted image"), b"pasted");
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("image (2).png")).expect("original image"),
+        b"original"
+    );
+}
+
+#[test]
+fn concurrent_image_pastes_keep_every_payload() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        let handles = (0u8..8)
+            .map(|value| {
+                let dir = dir.path();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let path = write_pasted_image(dir, &[value]).expect("concurrent paste");
+                    (path, value)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let (path, value) = handle.join().expect("paste thread");
+            assert_eq!(std::fs::read(path).expect("pasted payload"), [value]);
+        }
+    });
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .expect("image directory")
+            .count(),
+        8
+    );
+}
+
+#[test]
+fn image_paste_reports_missing_destination() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    assert_eq!(
+        write_pasted_image(&dir.path().join("missing"), b"image")
+            .expect_err("missing destination must fail")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
 fn incoming_file_lists_preserve_local_and_remote_locations() {
     let files = gtk::gdk::FileList::from_array(&[
         gio::File::for_path("/fixture/photo.raw"),
@@ -220,6 +279,56 @@ fn file_drop_action_hover_matches_cross_volume_strategy() {
 }
 
 #[test]
+fn file_drop_commit_rejects_the_recent_collection() {
+    crate::test_support::gtk_test(
+        "ui::browser::clipboard::tests::file_drop_commit_rejects_the_recent_collection",
+        || {
+            let recent = Location::uri("recent:///");
+            let prepared = prepare_file_drop_target({
+                let recent = recent.clone();
+                move || Some(recent.clone())
+            });
+
+            assert_eq!(
+                file_drop_commit(
+                    &prepared.target,
+                    &recent,
+                    &[Location::local("/fixture/source.txt")],
+                    &prepared.state,
+                ),
+                crate::services::DropCommit::Forbidden
+            );
+        },
+    );
+}
+
+#[test]
+fn paste_into_rejects_the_recent_collection_at_the_action_boundary() {
+    crate::test_support::gtk_test(
+        "ui::browser::clipboard::tests::paste_into_rejects_the_recent_collection_at_the_action_boundary",
+        || {
+            let view = crate::ui::browser::BrowserView::new(
+                Rc::new(crate::adapters::LocalFileSource),
+                crate::ui::browser::PeekBehavior::default(),
+            );
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let observed = events.clone();
+            view.browser()
+                .observe(move |event| observed.borrow_mut().push(event.clone()));
+
+            view.state.paste_into(Location::uri("recent:///"));
+
+            assert!(
+                !events
+                    .borrow()
+                    .iter()
+                    .any(|event| matches!(event, crate::app::BrowserEvent::TransferStarted { .. }))
+            );
+        },
+    );
+}
+
+#[test]
 fn move_only_protocol_still_copies_across_volumes() {
     let dest = gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE;
     let offered = offered_file_actions(dest, gtk::gdk::DragAction::MOVE);
@@ -263,63 +372,6 @@ fn copy_only_source_does_not_move_on_the_same_volume() {
 }
 
 #[test]
-fn file_drop_sites_commit_through_drop_strategy() {
-    let clipboard = include_str!("../clipboard.rs");
-    let drop_fn = function_source(clipboard, "fn transfer_dropped_files");
-    assert!(drop_fn.contains("file_drop_commit"));
-    assert!(drop_fn.contains("commit_file_drop"));
-    assert!(!drop_fn.contains("start_transfer"));
-
-    let paste_fn = function_source(clipboard, "fn paste_into");
-    assert!(paste_fn.contains("start_transfer"));
-    assert!(!paste_fn.contains("commit_file_drop"));
-
-    let rows = include_str!("../columns/rows.rs");
-    assert!(rows.contains("commit_file_drop"));
-    assert!(rows.contains("file_drop_commit"));
-    assert!(!rows.contains("start_transfer"));
-
-    let modes = include_str!("../../browser_modes.rs");
-    assert!(modes.contains("file_drop_commit"));
-    assert!(
-        !function_source(modes, "fn install_mode_directory_drop_target").contains("start_transfer")
-    );
-    assert!(!function_source(modes, "fn install_list_drag_drop").contains("start_transfer"));
-
-    let window = include_str!("../../window.rs");
-    assert!(function_source(window, "fn install_sidebar_file_drop").contains("commit_file_drop"));
-    assert!(function_source(window, "fn install_sidebar_file_drop").contains("file_drop_commit"));
-
-    let browser = include_str!("../../browser.rs");
-    assert!(browser.contains("commit_file_drop"));
-}
-
-fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
-    let start = source
-        .find(signature)
-        .unwrap_or_else(|| panic!("missing {signature}"));
-    let rest = &source[start..];
-    let mut depth = 0usize;
-    let mut started = false;
-    for (index, ch) in rest.char_indices() {
-        match ch {
-            '{' => {
-                started = true;
-                depth += 1;
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if started && depth == 0 {
-                    return &rest[..=index];
-                }
-            }
-            _ => {}
-        }
-    }
-    rest
-}
-
-#[test]
 fn cut_clipboard_locations_match_regardless_of_order() {
     let first = Location::local("/fixture/first");
     let second = Location::local("/fixture/second");
@@ -359,6 +411,120 @@ fn cut_matches_gio_equivalent_representations() {
         std::slice::from_ref(&native),
         std::slice::from_ref(&Location::uri("file:///fixture/other"))
     ));
+}
+
+fn result_row(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+    if let Some(label) = widget.downcast_ref::<gtk::Label>()
+        && label.text() == name
+        && label.is_mapped()
+    {
+        let mut parent = label.parent();
+        while let Some(widget) = parent {
+            if widget.has_css_class("file-row") {
+                return Some(widget);
+            }
+            parent = widget.parent();
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        if let Some(row) = result_row(&widget, name) {
+            return Some(row);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+fn wait_for_result(condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "filtered result did not settle"
+        );
+        glib::MainContext::default().iteration(false);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn filtered_cut_feedback_follows_results_across_windows_and_rebuilds() {
+    crate::test_support::gtk_test(
+        "ui::browser::clipboard::tests::filtered_cut_feedback_follows_results_across_windows_and_rebuilds",
+        || {
+            use crate::ui::browser::{BrowserView, PeekBehavior};
+            use crate::ui::browser_modes::BrowserMode;
+            let fixture = tempfile::tempdir().expect("fixture");
+            std::fs::create_dir(fixture.path().join("nested")).expect("nested");
+            let cut = Location::local(fixture.path().join("nested/needle.txt"));
+            std::fs::write(cut.native_path().expect("path"), "cut").expect("file");
+            std::fs::write(fixture.path().join("needle-decoy.txt"), "uncut").expect("decoy");
+            let views: Vec<_> = (0..2)
+                .map(|_| {
+                    let view = BrowserView::new(
+                        Rc::new(crate::adapters::LocalFileSource),
+                        PeekBehavior::default(),
+                    );
+                    let window = gtk::Window::builder()
+                        .child(&view.widget())
+                        .default_width(900)
+                        .default_height(500)
+                        .build();
+                    window.present();
+                    view.browser().navigate(Location::local(fixture.path()));
+                    wait_for_result(|| {
+                        view.browser()
+                            .column_snapshot(0)
+                            .is_some_and(|s| !s.loading)
+                    });
+                    (view, window)
+                })
+                .collect();
+            for mode in [BrowserMode::Columns, BrowserMode::List, BrowserMode::Icons] {
+                clear_shared_cut();
+                for (view, _) in &views {
+                    view.set_view_mode(mode);
+                    assert!(view.show_filter_with_query("needle"));
+                    wait_for_result(|| result_row(&view.widget(), "needle.txt").is_some());
+                }
+                set_shared_cut(std::slice::from_ref(&cut));
+                for (view, _) in &views {
+                    assert!(
+                        result_row(&view.widget(), "needle.txt")
+                            .expect("cut result")
+                            .has_css_class("cut")
+                    );
+                    assert!(
+                        !result_row(&view.widget(), "needle-decoy.txt")
+                            .expect("decoy")
+                            .has_css_class("cut")
+                    );
+                    assert!(view.show_filter_with_query(""));
+                    wait_for_result(|| result_row(&view.widget(), "needle.txt").is_none());
+                    assert!(view.show_filter_with_query("needle"));
+                    wait_for_result(|| result_row(&view.widget(), "needle.txt").is_some());
+                    assert!(
+                        result_row(&view.widget(), "needle.txt")
+                            .expect("retained cut")
+                            .has_css_class("cut")
+                    );
+                }
+                clear_shared_cut();
+                for (view, _) in &views {
+                    assert!(
+                        !result_row(&view.widget(), "needle.txt")
+                            .expect("restored result")
+                            .has_css_class("cut")
+                    );
+                }
+            }
+            for (view, window) in views {
+                view.browser().clear_observer();
+                window.close();
+            }
+        },
+    );
 }
 
 #[test]

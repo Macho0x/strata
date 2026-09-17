@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::{
-    compression::{compress_7z, compress_tar, compress_zip},
+    compression::{compress_7z, compress_tar, compress_zip, inspect_archive_sources},
     decoders::extract_zip_from_archive,
     extraction::ArchiveOutcome,
 };
@@ -32,8 +32,12 @@ pub(super) fn test_file_entry(path: &Path) -> FileEntry {
         kind: EntryKind::File,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
+        recent_unix_seconds: MetadataValue::Unknown,
         is_hidden: false,
         mode: MetadataValue::Unknown,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
     }
 }
 
@@ -66,8 +70,19 @@ pub(super) fn write_compression_fixture(
     match format {
         ArchiveFormat::Zip => compress_zip(file, entries, password, &progress, &cancelled),
         ArchiveFormat::SevenZ => compress_7z(file, entries, password, &progress, &cancelled),
-        ArchiveFormat::Tar => compress_tar(file, entries, false, &progress, &cancelled),
-        ArchiveFormat::TarGz => compress_tar(file, entries, true, &progress, &cancelled),
+        ArchiveFormat::Tar => compress_tar(file, entries, None, &progress, &cancelled),
+        ArchiveFormat::TarGz => compress_tar(
+            file,
+            entries,
+            Some(
+                inspect_archive_sources(entries, &cancelled)
+                    .map_err(|error| error.to_string())?
+                    .gzip_level(),
+            ),
+            &progress,
+            &cancelled,
+        ),
+        ArchiveFormat::Rar => return Err("RAR compression is not supported".to_owned()),
     }
     .map_err(|error| error.to_string())?;
     Ok(progress.load(Ordering::Relaxed))
@@ -213,3 +228,12 @@ pub(super) fn write_zip_stored(
     writer.finish()?;
     Ok(())
 }
+
+pub(super) const RAR_VERSION_FIXTURE: &[u8] =
+    include_bytes!("../../../../tests/fixtures/rar/version.rar");
+pub(super) const RAR_ENCRYPTED_FIXTURE: &[u8] =
+    include_bytes!("../../../../tests/fixtures/rar/encrypted.rar");
+pub(super) const RAR_COMMENT_HPW_FIXTURE: &[u8] =
+    include_bytes!("../../../../tests/fixtures/rar/comment-hpw-password.rar");
+pub(super) const RAR_UNICODE_FIXTURE: &[u8] =
+    include_bytes!("../../../../tests/fixtures/rar/unicode.rar");

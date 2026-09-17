@@ -341,8 +341,10 @@ impl ViewState {
             };
             let row = column.bound_rows.borrow().iter().find_map(|bound| {
                 (bound.item.upgrade()?.position() == position)
-                    .then(|| bound.row.upgrade().map(|row| row.upcast::<gtk::Widget>()))
+                    .then(|| bound.row.upgrade())
                     .flatten()
+                    .filter(|row| row.is_mapped() && row.is_ancestor(&column.list))
+                    .map(|row| row.upcast::<gtk::Widget>())
             });
             (
                 position,
@@ -721,14 +723,24 @@ impl ViewState {
             if let Some(value) = scroll_value.get() {
                 scroll.vadjustment().set_value(value);
             }
-            // Focus the native item, not ListView's stale pre-sort keyboard cursor.
+            // GTK may keep a removed native row as root focus after a splice.
+            // Recover it without taking focus from an attached outside control.
             if let Some(focus) = list.root().and_then(|root| root.focus())
-                && (focus == *list || focus.is_ancestor(list))
+                && (focus == *list
+                    || focus.is_ancestor(list)
+                    || list.is_ancestor(&focus)
+                    || focus.root().is_none())
                 && let Some(cursor) = row.parent()
             {
                 let adjustment = scroll.vadjustment();
                 let value = adjustment.value();
-                cursor.grab_focus();
+                if focus.root().is_none() {
+                    if let Some(root) = list.root() {
+                        root.set_focus(Some(&cursor));
+                    }
+                } else {
+                    cursor.grab_focus();
+                }
                 adjustment.set_value(value);
             }
             let allocated = reveal_rename_row(&row, &scroll, footer.as_ref());
@@ -870,7 +882,14 @@ impl ViewState {
                 .flatten();
             if let Some(position) = position {
                 if !selected.replace(true) {
-                    state.browser.select(pending.depth, position);
+                    if state.mode_views.borrow().mode() == BrowserMode::Columns {
+                        state.browser.reveal_created_entry(pending.depth, position);
+                        // Revealing the child synchronously truncates columns and cancels
+                        // pending editors. Retain this creation's authority for the next frame.
+                        state.pending_new_entry.replace(Some(pending.clone()));
+                    } else {
+                        state.browser.select(pending.depth, position);
+                    }
                 } else if let Some(entry) = state.browser.entry_at(pending.depth, position)
                     && state.begin_rename_item(pending.depth, position, entry)
                 {
@@ -896,7 +915,7 @@ impl ViewState {
         location: Location,
         is_directory: bool,
     ) {
-        if is_trash_location(&location) {
+        if is_trash_location(&location) || location.is_recent_location() {
             return;
         }
         self.cancel_new_entry();
@@ -922,7 +941,58 @@ impl ViewState {
         self.pending_new_entry.take().is_some()
     }
 
+    pub(in crate::ui) fn schedule_click_rename(
+        self: &Rc<Self>,
+        depth: usize,
+        source_position: usize,
+    ) {
+        self.cancel_click_rename();
+        let Some(entry) = self.browser.entry_at(depth, source_position) else {
+            return;
+        };
+        let generation = self.click_rename_generation.get() + 1;
+        self.click_rename_generation.set(generation);
+        let interval = self.scroller.settings().gtk_double_click_time().max(1) as u64;
+        let weak = Rc::downgrade(self);
+        let id = gtk::glib::timeout_add_local_once(
+            std::time::Duration::from_millis(interval),
+            move || {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                if state.click_rename_generation.get() != generation {
+                    return;
+                }
+                state.pending_click_rename.take();
+                if state.rename_operation_pending()
+                    || state.active_rename.borrow().is_some()
+                    || state.browser.selected_entries().len() != 1
+                    || !state.browser.focused_item().is_some_and(
+                        |(current_depth, position, current)| {
+                            current_depth == depth
+                                && position == source_position
+                                && current.location == entry.location
+                        },
+                    )
+                {
+                    return;
+                }
+                state.begin_rename();
+            },
+        );
+        self.pending_click_rename.replace(Some(id));
+    }
+
+    pub(in crate::ui) fn cancel_click_rename(&self) {
+        if let Some(id) = self.pending_click_rename.take() {
+            id.remove();
+        }
+        self.click_rename_generation
+            .set(self.click_rename_generation.get() + 1);
+    }
+
     pub(super) fn begin_rename(self: &Rc<Self>) -> bool {
+        self.cancel_click_rename();
         if self.rename_operation_pending() {
             return false;
         }
@@ -970,7 +1040,9 @@ impl ViewState {
         super::prepare_collection_inline_edit(column.list.upcast_ref(), filtered_position);
         let row = column.bound_rows.borrow().iter().find_map(|bound| {
             let item = bound.item.upgrade()?;
-            (item.position() == filtered_position).then(|| bound.row.upgrade())?
+            (item.position() == filtered_position)
+                .then(|| bound.row.upgrade())?
+                .filter(|row| row.is_mapped() && row.is_ancestor(&column.list))
         })?;
         if !row.is_mapped() || row.width() <= 0 || column.presentation.stack.is_transition_running()
         {
@@ -1060,6 +1132,7 @@ impl ViewState {
     }
 
     pub(super) fn cancel_rename(&self) -> bool {
+        self.cancel_click_rename();
         let mode_rename = self.mode_views.borrow().take_rename();
         if let Some(mode_rename) = mode_rename {
             finish_mode_rename(mode_rename);

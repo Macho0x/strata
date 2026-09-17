@@ -5,9 +5,9 @@ use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::Path};
 use gtk::gio;
 
 use super::{
-    GIO_FALLBACK_BACKENDS, LaunchMode, encode_daemon_pids, gvfs_daemon_pids,
-    gvfs_probe_marker_is_fresh_at, gvfs_probe_marker_path_in, launch_mode, open_requests,
-    run_preview_helper,
+    CommandLineAction, LaunchMode, classify_command_line, classify_udiskie_hook,
+    encode_daemon_pids, gvfs_daemon_pids, gvfs_probe_marker_is_fresh_at, gvfs_probe_marker_path_in,
+    launch_mode, run_preview_helper, version_line,
 };
 
 #[test]
@@ -35,6 +35,11 @@ fn launch_mode_recognizes_only_the_first_argument_as_a_mode() {
         ("--install-portal", LaunchMode::InstallPortal),
         ("--dismiss-portal-prompt", LaunchMode::DismissPortalPrompt),
         ("--uninstall-portal", LaunchMode::UninstallPortal),
+        ("--version", LaunchMode::Version),
+        ("--udiskie-hook", LaunchMode::UdiskieHook),
+        ("--install-udiskie-unlock", LaunchMode::InstallUdiskie),
+        ("--uninstall-udiskie-unlock", LaunchMode::UninstallUdiskie),
+        ("--unlock-volume", LaunchMode::Application),
     ] {
         assert_eq!(launch_mode(&["strata".into(), flag.into()]), mode);
         assert_eq!(
@@ -42,6 +47,90 @@ fn launch_mode_recognizes_only_the_first_argument_as_a_mode() {
             LaunchMode::Application
         );
     }
+}
+
+#[test]
+fn classify_udiskie_hook_encrypted_device_added() {
+    let uuid = "6e5d75a7-e4e2-4c7d-9c1c-8e5a5e5d75a7";
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (
+            &["device_added", "crypto", "/dev/sdb1", uuid],
+            Some("/dev/sdb1"),
+        ),
+        (&["device_added", "crypto", "", uuid], Some(uuid)),
+        (&["device_added", "filesystem", "/dev/sdb1", uuid], None),
+    ];
+    for (arguments, expected) in cases {
+        let arguments: Vec<OsString> = arguments.iter().copied().map(OsString::from).collect();
+        assert_eq!(
+            classify_udiskie_hook(&arguments),
+            *expected,
+            "hook arguments {arguments:?} should classify as {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn classify_udiskie_hook_non_utf8_fields() {
+    let non_utf8 = OsString::from_vec(b"\xff".to_vec());
+    assert_eq!(
+        classify_udiskie_hook(&[
+            "device_added".into(),
+            "crypto".into(),
+            non_utf8,
+            "6e5d75a7-e4e2-4c7d-9c1c-8e5a5e5d75a7".into(),
+        ]),
+        None,
+        "a non-UTF-8 device_file should reject rather than panic"
+    );
+}
+
+#[test]
+fn classify_command_line_unlock_volume() {
+    match classify_command_line(Some("/dev/sdb1"), &[], false, false) {
+        CommandLineAction::Unlock(target) => {
+            assert_eq!(target.unix_device.as_deref(), Some(Path::new("/dev/sdb1")));
+            assert_eq!(target.uuid, None);
+        }
+        other => panic!("unix-device should unlock, got {other:?}"),
+    }
+    match classify_command_line(Some("6e5d75a7e4e24c7d9c1c8e5a5e5d75a7"), &[], false, false) {
+        CommandLineAction::Unlock(target) => {
+            assert_eq!(target.unix_device, None);
+            assert_eq!(
+                target.uuid.as_deref(),
+                Some("6e5d75a7-e4e2-4c7d-9c1c-8e5a5e5d75a7")
+            );
+        }
+        other => panic!("compact UUID should unlock, got {other:?}"),
+    }
+    match classify_command_line(Some("not-a-valid-uuid"), &[], false, false) {
+        CommandLineAction::Usage(_) => {}
+        other => panic!("invalid operand should be usage, got {other:?}"),
+    }
+    let file = gio::File::for_path("/tmp/Documents");
+    match classify_command_line(Some("/dev/sdb1"), std::slice::from_ref(&file), false, false) {
+        CommandLineAction::Usage(_) => {}
+        other => panic!("unlock with files should be usage, got {other:?}"),
+    }
+}
+
+#[test]
+fn version_line_is_the_package_name_and_installed_version() {
+    let line = version_line();
+    assert!(
+        line.starts_with("strata "),
+        "the --version line should start with the package name"
+    );
+    assert!(
+        line.contains(&crate::build_info::installed_version().to_string()),
+        "the --version line should include the installed version"
+    );
+    assert_eq!(
+        line.lines().count(),
+        1,
+        "the --version line should be a single line"
+    );
 }
 
 #[test]
@@ -57,91 +146,6 @@ fn preview_helper_rejects_non_utf8_instead_of_changing_paths() {
         run_preview_helper(&arguments),
         Err("Invalid UTF-8 in preview helper arguments".to_owned())
     );
-}
-
-#[test]
-fn open_requests_preserve_directory_and_remote_arguments() {
-    let non_utf8 = OsString::from_vec(b"/tmp/\xff".to_vec());
-    let files = [
-        gio::File::for_uri("smb://host/share"),
-        gio::File::for_path("/tmp/first"),
-        gio::File::for_path("/tmp/second"),
-        gio::File::for_path(&non_utf8),
-        gio::File::for_uri("sftp://host/share"),
-        gio::File::for_uri("trash:///"),
-    ];
-
-    let requests = open_requests(&files);
-    assert!(requests.iter().all(|request| request.selection.is_empty()));
-    let locations: Vec<_> = requests.iter().map(|request| &request.directory).collect();
-
-    assert_eq!(locations.len(), files.len());
-    assert!(
-        locations[0]
-            .uri_value()
-            .is_some_and(|uri| uri.starts_with("smb://host/share")),
-        "{:?}",
-        locations[0]
-    );
-    assert_eq!(locations[1].native_path(), Some(Path::new("/tmp/first")));
-    assert_eq!(locations[2].native_path(), Some(Path::new("/tmp/second")));
-    assert_eq!(locations[3].native_path(), Some(Path::new(&non_utf8)));
-    for (location, scheme) in locations[4..].iter().zip(["sftp:", "trash:"]) {
-        assert!(
-            location
-                .uri_value()
-                .is_some_and(|uri| uri.starts_with(scheme))
-        );
-    }
-    assert!(open_requests(&[]).is_empty());
-}
-
-#[test]
-fn open_requests_reveal_local_files_but_open_directories() {
-    use gtk::prelude::*;
-
-    let root = tempfile::tempdir().expect("temporary directory");
-    let directory = root
-        .path()
-        .join(OsString::from_vec(b"parent-\xff".to_vec()));
-    std::fs::create_dir(&directory).expect("create parent directory");
-    let file = directory.join("open me.txt");
-    std::fs::write(&file, "hello").expect("create file");
-    let link = directory.join("linked.txt");
-    std::os::unix::fs::symlink(&file, &link).expect("create symlink");
-    let missing = directory.join("missing.txt");
-    let broken_link = directory.join("broken.txt");
-    std::os::unix::fs::symlink(&missing, &broken_link).expect("create broken symlink");
-    let directory_link = root.path().join("linked-directory");
-    std::os::unix::fs::symlink(&directory, &directory_link).expect("create directory symlink");
-    let files = [
-        gio::File::for_path(&directory),
-        gio::File::for_path(&file),
-        gio::File::for_uri(gio::File::for_path(&file).uri().as_str()),
-        gio::File::for_path(&link),
-        gio::File::for_path(&broken_link),
-    ];
-
-    let requests = open_requests(&files);
-
-    assert_eq!(requests.len(), files.len());
-    for (request, selection) in requests.iter().zip([
-        vec![],
-        vec!["open me.txt"],
-        vec!["open me.txt"],
-        vec!["linked.txt"],
-        vec!["broken.txt"],
-    ]) {
-        assert_eq!(request.directory.native_path(), Some(directory.as_path()));
-        assert_eq!(request.selection, selection);
-        assert!(!request.properties);
-    }
-    for path in [&directory_link, &missing] {
-        let requests = open_requests(&[gio::File::for_path(path)]);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].directory.native_path(), Some(path.as_path()));
-        assert!(requests[0].selection.is_empty());
-    }
 }
 
 fn fake_proc(label: &str, processes: &[(&str, &str)]) -> std::path::PathBuf {
@@ -216,12 +220,4 @@ fn only_a_readable_matching_marker_is_fresh() {
 
     std::fs::write(&marker, [0xff]).expect("the unreadable marker should be written");
     assert!(!gvfs_probe_marker_is_fresh_at(&marker, &proc_root));
-}
-
-#[test]
-fn gvfs_fallback_covers_files_and_volumes() {
-    assert_eq!(
-        GIO_FALLBACK_BACKENDS,
-        [("GIO_USE_VFS", "local"), ("GIO_USE_VOLUME_MONITOR", "unix"),]
-    );
 }

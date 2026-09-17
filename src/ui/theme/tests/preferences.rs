@@ -2,6 +2,7 @@
 
 use super::super::*;
 use crate::{
+    model::{SortDirection, SortKey, ViewPreferences},
     test_support::gtk_test,
     ui::browser_modes::{BrowserDensity, BrowserMode, ClickCount},
 };
@@ -13,13 +14,16 @@ fn non_default_preferences() -> Preferences {
         theme: "nord".into(),
         folder_peeking: false,
         single_click_previews: false,
+        render_documents_by_default: false,
         hardware_accelerated_video_previews: Some(false),
         video_preview_backend: "vulkan".into(),
         search_open_files_directly: true,
         type_to_search: false,
+        arrow_navigation_scoped: true,
         filter_include_subfolders: false,
         show_keybinding_hints: false,
         reduce_motion: true,
+        element_glow: false,
         browser_mode: "list".into(),
         browser_density: "airy".into(),
         group_by_type: true,
@@ -36,17 +40,29 @@ fn non_default_preferences() -> Preferences {
             "documents".into(),
             "desktop".into(),
         ],
+        sidebar_show_home: false,
+        sidebar_show_trash: false,
+        sidebar_show_network: false,
+        sidebar_show_recent: false,
+        sidebar_show_desktop: false,
+        sidebar_show_documents: false,
+        sidebar_show_downloads: false,
+        sidebar_show_pictures: false,
+        sidebar_show_videos: false,
         show_hidden: true,
-        text_size: "large".into(),
+        text_size: TextSize::new(24),
         folders_first: false,
         sort_key: "size".into(),
         sort_direction: "descending".into(),
         check_for_updates: false,
         preview_muted: true,
         preview_volume: 0.35,
+        preview_text_wrap: true,
         auto_refresh_interval: 600,
         cross_volume_drop_strategy: CrossVolumeDropStrategy::Move.as_str().into(),
+        open_folder_after_drop: true,
         release_channel: "nightly".into(),
+        default_directory: Some("/fixture/default".into()),
         folder_colors: HashMap::from([("/fixture/folder".into(), "red".into())]),
         custom_icons: HashMap::from([(
             "/fixture/folder".into(),
@@ -80,14 +96,40 @@ impl ThemeManager {
 }
 
 #[test]
-fn older_preferences_keep_recursive_filtering_enabled() {
+fn recent_sort_is_not_stored_as_an_ordinary_folder_default() {
+    gtk_test(
+        "ui::theme::tests::preferences::recent_sort_is_not_stored_as_an_ordinary_folder_default",
+        || {
+            ThemeManager::seed_saved_preferences_for_test();
+            let manager = ThemeManager::load();
+            let saved = manager.preferences.borrow().clone();
+
+            manager.set_sort_preferences(ViewPreferences {
+                sort_key: SortKey::Recency,
+                sort_direction: SortDirection::Descending,
+                ..ViewPreferences::default()
+            });
+
+            assert_eq!(*manager.preferences.borrow(), saved);
+            let persisted: Preferences =
+                toml::from_str(&fs::read_to_string(settings_path()).expect("saved preferences"))
+                    .expect("persisted preferences");
+            assert_eq!(persisted, saved);
+        },
+    );
+}
+
+#[test]
+fn older_preferences_keep_backward_compatible_behavior_defaults() {
     let mut saved = toml::Table::try_from(non_default_preferences()).expect("saved preferences");
     saved.remove("filter_include_subfolders");
+    saved.remove("open_folder_after_drop");
     let restored: Preferences = saved.try_into().expect("backward-compatible preferences");
     assert_eq!(
         restored,
         Preferences {
             filter_include_subfolders: true,
+            open_folder_after_drop: false,
             ..non_default_preferences()
         }
     );
@@ -335,9 +377,39 @@ fn every_saved_preference_loads_before_any_settings_page_exists() {
             );
             assert!(manager.search_open_files_directly());
             assert!(!manager.type_to_search());
+            assert!(manager.arrow_navigation_scoped());
             assert!(!manager.filter_include_subfolders());
             assert!(!manager.show_keybinding_hints());
             assert!(manager.reduce_motion());
+            assert!(!manager.element_glow());
+            let windows = [gtk::Window::new(), gtk::Window::new()];
+            for enabled in [false, true, false] {
+                manager.set_element_glow(enabled);
+                for window in &windows {
+                    let surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    window.set_child(Some(&surface));
+                    #[expect(
+                        deprecated,
+                        reason = "GTK has no replacement API for resolving named CSS colors"
+                    )]
+                    let (glow, accent) = {
+                        let style = surface.style_context();
+                        (
+                            style.lookup_color("theme_glow").expect("glow color"),
+                            style.lookup_color("theme_accent").expect("accent color"),
+                        )
+                    };
+                    if enabled {
+                        assert_eq!(glow, accent);
+                    } else {
+                        assert_eq!(glow.alpha(), 0.0);
+                        assert!(accent.alpha() > 0.0);
+                    }
+                }
+            }
+            for window in windows {
+                window.close();
+            }
             assert!(!crate::ui::motion::animations_enabled());
             assert_eq!(manager.browser_mode(), BrowserMode::List);
             assert_eq!(manager.browser_density(), BrowserDensity::Airy);
@@ -358,7 +430,22 @@ fn every_saved_preference_loads_before_any_settings_page_exists() {
                 manager.sidebar_order(),
                 non_default_preferences().sidebar_order
             );
-            assert_eq!(manager.text_size(), TextSize::Large);
+            assert!(!manager.sidebar_show_home());
+            assert!(!manager.sidebar_show_trash());
+            assert!(!manager.sidebar_show_network());
+            assert!(!manager.sidebar_show_recent());
+            assert!(!manager.sidebar_show_desktop());
+            assert!(!manager.sidebar_show_documents());
+            assert!(!manager.sidebar_show_downloads());
+            assert!(!manager.sidebar_show_pictures());
+            assert!(!manager.sidebar_show_videos());
+            assert_eq!(
+                manager.sidebar_places_visibility(),
+                [
+                    false, false, false, false, false, false, false, false, false
+                ]
+            );
+            assert_eq!(manager.text_size(), TextSize::new(24));
             assert_eq!(
                 manager.sort_preferences(),
                 ViewPreferences {
@@ -372,10 +459,15 @@ fn every_saved_preference_loads_before_any_settings_page_exists() {
             assert_eq!(manager.release_channel(), Channel::Nightly);
             assert!(manager.preview_muted());
             assert_eq!(manager.preview_volume(), 0.35);
+            assert!(manager.preview_text_wrap());
             assert_eq!(manager.auto_refresh_interval(), 600);
             assert_eq!(
                 manager.cross_volume_drop_strategy(),
                 CrossVolumeDropStrategy::Move
+            );
+            assert_eq!(
+                manager.default_directory(),
+                Some(std::path::PathBuf::from("/fixture/default"))
             );
             assert_eq!(
                 manager.folder_color(Path::new("/fixture/folder")),
@@ -441,13 +533,16 @@ fn all_preference_setters_publish_and_persist_without_duplicate_notifications() 
             let setters: &[fn(&ThemeManager)] = &[
                 |m| m.set_folder_peeking(true),
                 |m| m.set_single_click_previews(true),
+                |m| m.set_render_documents_by_default(true),
                 |m| m.set_hardware_accelerated_video_previews(true),
                 |m| m.set_video_preview_backend(MediaPreviewBackend::VaApi),
                 |m| m.set_search_open_files_directly(false),
                 |m| m.set_type_to_search(true),
+                |m| m.set_arrow_navigation_scoped(false),
                 |m| m.set_filter_include_subfolders(true),
                 |m| m.set_show_keybinding_hints(true),
                 |m| m.set_reduce_motion(false),
+                |m| m.set_element_glow(true),
                 |m| m.set_browser_mode(BrowserMode::Icons),
                 |m| m.set_browser_density(BrowserDensity::Compact),
                 |m| m.set_group_by_type(false),
@@ -472,14 +567,26 @@ fn all_preference_setters_publish_and_persist_without_duplicate_notifications() 
                     )
                 },
                 |m| m.set_sidebar_order(default_sidebar_order()),
+                |m| m.set_sidebar_show_home(true),
+                |m| m.set_sidebar_show_trash(true),
+                |m| m.set_sidebar_show_network(true),
+                |m| m.set_sidebar_show_recent(true),
+                |m| m.set_sidebar_show_desktop(true),
+                |m| m.set_sidebar_show_documents(true),
+                |m| m.set_sidebar_show_downloads(true),
+                |m| m.set_sidebar_show_pictures(true),
+                |m| m.set_sidebar_show_videos(true),
                 |m| m.set_sort_preferences(ViewPreferences::default()),
-                |m| m.set_text_size(TextSize::Small),
+                |m| m.set_text_size(TextSize::new(11)),
                 |m| m.set_checks_for_updates(true),
                 |m| m.set_release_channel(Channel::Stable),
                 |m| m.set_preview_muted(false),
                 |m| m.set_preview_volume(0.8),
+                |m| m.set_preview_text_wrap(false),
                 |m| m.set_auto_refresh_interval(60),
                 |m| m.set_cross_volume_drop_strategy(CrossVolumeDropStrategy::Copy),
+                |m| m.set_default_directory(None),
+                |m| m.set_open_folder_after_drop(false),
                 |m| m.set_folder_color(Path::new("/fixture/folder"), None),
                 |m| m.set_custom_icon(Path::new("/fixture/folder"), None),
                 |m| m.set_follow_omarchy(true),

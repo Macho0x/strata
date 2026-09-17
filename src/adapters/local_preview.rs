@@ -1,27 +1,107 @@
 // SPDX-License-Identifier: MIT
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
-    time::Duration,
 };
 
+mod remote;
+
+use futures_channel::oneshot;
 use gtk::{gio, glib, prelude::*};
 
 use crate::{
     adapters::gio_file_for_location,
-    sandbox::{Cancellation, MediaPreviewBackend, ParseOperation},
+    sandbox::{Cancellation, MediaPreviewBackend, ParseOperation, PdfRenderSize},
     services::{
-        LoadHandle, Preview, PreviewContent, PreviewEvent, PreviewProvider, PreviewRequest,
-        content_family, has_plain_text_extension, is_non_executable_extensionless_dotfile,
+        LoadHandle, MediaPreviewSize, Preview, PreviewContent, PreviewEvent, PreviewProvider,
+        PreviewRequest, SandboxedMedia, content_family, document_kind, has_plain_text_extension,
+        is_non_executable_extensionless_dotfile, layout_document, normalize_preview_text,
+        parse_document,
     },
 };
 
 const MAX_PREVIEW_CACHE_ENTRIES: usize = 64;
 const MAX_PREVIEW_CACHE_BYTES: usize = 128 * 1024 * 1024;
-const PROGRESSIVE_RENDER_SETTLE_DELAY: Duration = Duration::from_millis(50);
+const MAX_CONCURRENT_PDF_RENDERS: usize = 1;
+
+#[derive(Default)]
+struct PdfRenderQueue {
+    running: usize,
+    next_id: u64,
+    queued: VecDeque<(u64, oneshot::Sender<PdfRenderPermit>)>,
+}
+
+struct PdfRenderWaiter {
+    id: u64,
+    receive: Option<oneshot::Receiver<PdfRenderPermit>>,
+}
+
+impl PdfRenderWaiter {
+    async fn acquire(mut self) -> Option<PdfRenderPermit> {
+        self.receive.take()?.await.ok()
+    }
+}
+
+impl Drop for PdfRenderWaiter {
+    fn drop(&mut self) {
+        PDF_RENDER_QUEUE.with(|queue| {
+            queue.borrow_mut().queued.retain(|(id, _)| *id != self.id);
+        });
+    }
+}
+
+struct PdfRenderPermit;
+
+impl Drop for PdfRenderPermit {
+    fn drop(&mut self) {
+        release_pdf_render_permit();
+    }
+}
+
+fn request_pdf_render_permit() -> PdfRenderWaiter {
+    let (send, receive) = oneshot::channel();
+    let (id, start) = PDF_RENDER_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let id = queue.next_id;
+        queue.next_id = queue.next_id.saturating_add(1);
+        if queue.running < MAX_CONCURRENT_PDF_RENDERS {
+            queue.running += 1;
+            (id, Some(send))
+        } else {
+            queue.queued.push_back((id, send));
+            (id, None)
+        }
+    });
+    if let Some(send) = start
+        && let Err(permit) = send.send(PdfRenderPermit)
+    {
+        drop(permit);
+    }
+    PdfRenderWaiter {
+        id,
+        receive: Some(receive),
+    }
+}
+
+fn release_pdf_render_permit() {
+    let next = PDF_RENDER_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        queue.running = queue.running.saturating_sub(1);
+        let next = queue.queued.pop_front().map(|(_, send)| send);
+        if next.is_some() {
+            queue.running += 1;
+        }
+        next
+    });
+    if let Some(send) = next
+        && let Err(permit) = send.send(PdfRenderPermit)
+    {
+        drop(permit);
+    }
+}
 
 struct PreviewCache {
     entries: HashMap<PreviewCacheKey, PreviewContent>,
@@ -33,7 +113,7 @@ struct PreviewCache {
 struct PreviewCacheKey {
     path: PathBuf,
     modified: i64,
-    pdf_page: Option<i32>,
+    pdf_page: Option<(i32, PdfRenderSize)>,
 }
 
 impl PreviewCache {
@@ -45,6 +125,9 @@ impl PreviewCache {
     }
 
     fn insert(&mut self, key: PreviewCacheKey, content: PreviewContent) {
+        if matches!(content, PreviewContent::SandboxedMedia { .. }) {
+            return;
+        }
         let bytes = preview_content_size(&content);
         self.recent.retain(|k| k != &key);
         if let Some(old) = self.entries.remove(&key) {
@@ -71,13 +154,14 @@ impl PreviewCache {
 fn preview_content_size(content: &PreviewContent) -> usize {
     match content {
         PreviewContent::Rasterized { png } | PreviewContent::Pdf { png, .. } => png.len(),
-        PreviewContent::SandboxedMedia { data } => data.len(),
+        PreviewContent::SandboxedMedia { .. } => 0,
         PreviewContent::Text { content, .. } => content.len(),
         _ => 0,
     }
 }
 
 thread_local! {
+    static PDF_RENDER_QUEUE: RefCell<PdfRenderQueue> = RefCell::new(PdfRenderQueue::default());
     static PREVIEW_CACHE: RefCell<PreviewCache> = RefCell::new(PreviewCache {
         entries: HashMap::new(),
         recent: VecDeque::new(),
@@ -99,11 +183,32 @@ impl LocalPreviewProvider {
 
 impl PreviewProvider for LocalPreviewProvider {
     fn load(&self, request: PreviewRequest, emit: Rc<dyn Fn(PreviewEvent)>) -> LoadHandle {
+        self.load_with_renderer(request, emit, crate::sandbox::parse)
+    }
+}
+
+impl LocalPreviewProvider {
+    fn load_with_renderer(
+        &self,
+        request: PreviewRequest,
+        emit: Rc<dyn Fn(PreviewEvent)>,
+        render: impl FnOnce(
+            &Path,
+            ParseOperation,
+            i32,
+            MediaPreviewBackend,
+            &Cancellation,
+        ) -> Result<crate::sandbox::ParseOutput, String>
+        + Send
+        + 'static,
+    ) -> LoadHandle {
         let media_preview_backend = (self.media_preview_backend)();
         let request_id = request.id;
         let entry = request.entry.clone();
         let cancellation = Cancellation::default();
         let cancellation_for_task = cancellation.clone();
+        let abort_safe = Rc::new(Cell::new(true));
+        let abort_safe_for_task = abort_safe.clone();
         let task = glib::MainContext::default().spawn_local(async move {
             let (guessed_type, uncertain) =
                 gio::content_type_guess(Some(Path::new(&entry.native_name)), None::<&[u8]>);
@@ -164,31 +269,161 @@ impl PreviewProvider for LocalPreviewProvider {
                 content_type = queried_type;
             }
 
+            if crate::services::table::is_workbook(&content_type, &entry.native_name) {
+                let Some(path) = entry.location.native_path().map(ToOwned::to_owned) else {
+                    emit(PreviewEvent::Failed { request_id, entry, message: "Copy this workbook locally before previewing it".into() });
+                    return;
+                };
+                // Share the full-document parser slot with PDF rendering. Keep it
+                // until the cancelled helper exits, not merely until the UI closes.
+                let Some(permit) = request_pdf_render_permit().acquire().await else {
+                    return;
+                };
+                if cancellation_for_task.is_cancelled() {
+                    return;
+                }
+                abort_safe_for_task.set(false);
+                let cancellation = cancellation_for_task.clone();
+                let result = gio::spawn_blocking(move || {
+                    let output = render(&path, ParseOperation::PreviewWorkbook, 0, media_preview_backend, &cancellation)?;
+                    let parsed = crate::services::table::TableData::from_json(&output.data)?.into_document();
+                    layout_document(parsed.document, &cancellation).map(|document| PreviewContent::Workbook { document, warnings: parsed.warnings })
+                }).await;
+                abort_safe_for_task.set(true);
+                drop(permit);
+                if cancellation_for_task.is_cancelled() { return; }
+                match result {
+                    Ok(Ok(content)) => emit(PreviewEvent::Ready(Preview { request_id, entry, content_type, content })),
+                    Ok(Err(message)) => emit(PreviewEvent::Failed { request_id, entry, message }),
+                    Err(_) => emit(PreviewEvent::Failed { request_id, entry, message: "The preview worker stopped unexpectedly.".into() }),
+                }
+                return;
+            }
+
+            let document_kind = document_kind(
+                &content_type,
+                &entry.native_name,
+                entry.location.native_path().is_some(),
+            );
+            if document_kind.is_some() {
+                content = PreviewContent::Document {
+                    source: String::new(),
+                    document: None,
+                    fallback_reason: None,
+                    warnings: Vec::new(),
+                    truncated: false,
+                };
+            }
+
+            if matches!(content, PreviewContent::Media) {
+                let staged = if entry.location.native_path().is_none() {
+                    if !crate::services::supports_remote_video(&entry.native_name) {
+                        emit(PreviewEvent::Failed {
+                            request_id,
+                            entry,
+                            message: "Copy this media format locally before previewing it".into(),
+                        });
+                        return;
+                    }
+                    match remote::stage_video(&entry).await {
+                        Ok(staged) => Some(staged),
+                        Err(message) => {
+                            if !cancellation_for_task.is_cancelled() {
+                                emit(PreviewEvent::Failed {
+                                    request_id,
+                                    entry,
+                                    message,
+                                });
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let path = staged
+                    .as_ref()
+                    .map(|input| input.path())
+                    .or_else(|| entry.location.native_path())
+                    .expect("native or staged media")
+                    .to_path_buf();
+                let mut media = SandboxedMedia {
+                    path,
+                    size: request.media_size,
+                    backend: media_preview_backend,
+                    input_owner: None,
+                };
+                if let Some(staged) = staged {
+                    media = media.retain_input(staged);
+                }
+                if cancellation_for_task.is_cancelled() {
+                    return;
+                }
+                emit(PreviewEvent::Ready(Preview {
+                    request_id,
+                    entry,
+                    content_type,
+                    content: PreviewContent::SandboxedMedia { media },
+                }));
+                return;
+            }
+
             let operation = match content {
-                PreviewContent::Pdf { .. } => Some(ParseOperation::PreviewPdf),
+                PreviewContent::Pdf { .. } => Some(ParseOperation::PreviewPdf(pdf_render_size(
+                    request.media_size,
+                ))),
                 PreviewContent::Image => Some(ParseOperation::PreviewImage),
-                PreviewContent::Media => Some(ParseOperation::PreviewMedia),
+                PreviewContent::Media => None,
                 PreviewContent::Text { .. }
+                | PreviewContent::Document { .. }
+                | PreviewContent::Workbook { .. }
                 | PreviewContent::Rasterized { .. }
                 | PreviewContent::SandboxedMedia { .. }
                 | PreviewContent::Unsupported => None,
             };
             if let Some(operation) = operation {
-                let Some(path) = entry.location.native_path().map(ToOwned::to_owned) else {
-                    emit(PreviewEvent::Failed {
-                        request_id,
-                        entry,
-                        message: "Only local files can be previewed safely".to_owned(),
-                    });
-                    return;
+                let staged = if entry.location.native_path().is_none() {
+                    if !matches!(operation, ParseOperation::PreviewImage) {
+                        emit(PreviewEvent::Failed {
+                            request_id,
+                            entry,
+                            message:
+                                "Remote PDF previews are not supported; copy the file locally first"
+                                    .into(),
+                        });
+                        return;
+                    }
+                    match remote::stage(&entry).await {
+                        Ok(staged) => Some(staged),
+                        Err(message) => {
+                            if !cancellation_for_task.is_cancelled() {
+                                emit(PreviewEvent::Failed {
+                                    request_id,
+                                    entry,
+                                    message,
+                                });
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    None
                 };
+                let path = staged
+                    .as_ref()
+                    .map(|file| file.path())
+                    .or_else(|| entry.location.native_path())
+                    .expect("native or staged preview input")
+                    .to_path_buf();
+                // Remote originals are not written to persistent thumbnail caches.
                 let modified = match entry.modified_unix_seconds {
+                    _ if staged.is_some() => None,
                     crate::model::MetadataValue::Known(m) => Some(m),
                     crate::model::MetadataValue::Unknown
                     | crate::model::MetadataValue::Unavailable => None,
                 };
                 let pdf_page = match operation {
-                    ParseOperation::PreviewPdf => Some(request.pdf_page),
+                    ParseOperation::PreviewPdf(size) => Some((request.pdf_page, size)),
                     _ => None,
                 };
                 let cache_key = modified.map(|modified| PreviewCacheKey {
@@ -209,67 +444,46 @@ impl PreviewProvider for LocalPreviewProvider {
                     return;
                 }
 
-                let shared_thumbnail = if uses_shared_thumbnail(operation, request.pdf_page) {
-                    if let Some(mtime) = modified {
-                        let thumbnail_path = path.clone();
-                        gio::spawn_blocking(move || {
-                            crate::ui::thumbnail_cache::lookup(&thumbnail_path, mtime)
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let placeholder = shared_thumbnail.and_then(|thumb_png| match operation {
-                    ParseOperation::PreviewPdf if request.pdf_page == 0 => {
-                        Some(PreviewContent::Pdf {
-                            png: thumb_png,
-                            page: 0,
-                            pages: 1,
-                        })
-                    }
-                    ParseOperation::PreviewImage => {
-                        Some(PreviewContent::Rasterized { png: thumb_png })
-                    }
-                    _ => None,
-                });
-                let placeholder_emitted = placeholder.is_some();
-                if let Some(placeholder) = placeholder {
-                    emit(PreviewEvent::Ready(Preview {
-                        request_id,
-                        entry: entry.clone(),
-                        content_type: content_type.clone(),
-                        content: placeholder,
-                    }));
-                }
-
-                if !wait_for_full_render(placeholder_emitted, &cancellation_for_task).await {
+                if cancellation_for_task.is_cancelled() {
                     return;
                 }
 
+                let pdf_permit = if matches!(operation, ParseOperation::PreviewPdf(_)) {
+                    let Some(permit) = request_pdf_render_permit().acquire().await else {
+                        return;
+                    };
+                    if cancellation_for_task.is_cancelled() {
+                        return;
+                    }
+                    Some(permit)
+                } else {
+                    None
+                };
+                abort_safe_for_task.set(pdf_permit.is_none());
                 let value = request.pdf_page;
                 let cancellation = cancellation_for_task.clone();
                 let spawn_path = path.clone();
                 let mut thumbnail_to_store = None;
-                content = match gio::spawn_blocking(move || {
-                    crate::sandbox::parse(
+                let render = gio::spawn_blocking(move || {
+                    let _staged = staged;
+                    let output = render(
                         &spawn_path,
                         operation,
                         value,
                         media_preview_backend,
                         &cancellation,
-                    )
+                    )?;
+                    Ok::<_, String>(output)
                 })
-                .await
-                {
-                    Ok(Ok(output)) if operation == ParseOperation::PreviewPdf => {
+                .await;
+                abort_safe_for_task.set(true);
+                if cancellation_for_task.is_cancelled() {
+                    return;
+                }
+                content = match render {
+                    Ok(Ok(output)) if matches!(operation, ParseOperation::PreviewPdf(_)) => {
                         if let Some(mtime) = modified
                             && request.pdf_page == 0
-                            && !placeholder_emitted
                         {
                             thumbnail_to_store = Some((path.clone(), mtime, output.data.clone()));
                         }
@@ -279,13 +493,8 @@ impl PreviewProvider for LocalPreviewProvider {
                             pages: output.pages,
                         }
                     }
-                    Ok(Ok(output)) if operation == ParseOperation::PreviewMedia => {
-                        PreviewContent::SandboxedMedia { data: output.data }
-                    }
                     Ok(Ok(output)) => {
-                        if let Some(mtime) = modified
-                            && !placeholder_emitted
-                        {
+                        if let Some(mtime) = modified {
                             thumbnail_to_store = Some((path.clone(), mtime, output.data.clone()));
                         }
                         PreviewContent::Rasterized { png: output.data }
@@ -298,8 +507,19 @@ impl PreviewProvider for LocalPreviewProvider {
                         });
                         return;
                     }
-                    Err(_) => return,
+                    Err(_) => {
+                        if cancellation_for_task.is_cancelled() {
+                            return;
+                        }
+                        emit(PreviewEvent::Failed {
+                            request_id,
+                            entry,
+                            message: "The preview worker stopped unexpectedly.".to_owned(),
+                        });
+                        return;
+                    }
                 };
+                drop(pdf_permit);
                 if let Some(cache_key) = cache_key {
                     PREVIEW_CACHE.with(|cache| {
                         cache.borrow_mut().insert(cache_key, content.clone());
@@ -318,12 +538,88 @@ impl PreviewProvider for LocalPreviewProvider {
                     .await;
                 }
                 return;
-            } else if matches!(content, PreviewContent::Text { .. }) {
+            } else if matches!(
+                content,
+                PreviewContent::Text { .. } | PreviewContent::Document { .. }
+            ) {
                 let file = gio_file_for_location(&entry.location);
                 let native_path = entry.location.native_path().map(ToOwned::to_owned);
                 content =
                     match read_text(&file, native_path.as_deref(), request.text_byte_limit).await {
-                        Ok((content, truncated)) => PreviewContent::Text { content, truncated },
+                        Ok((source, truncated)) => {
+                            if let Some(kind) = document_kind {
+                                if truncated {
+                                    PreviewContent::Document {
+                                        source,
+                                        document: None,
+                                        fallback_reason: Some(
+                                            "Rendered view is unavailable because the document exceeds the 1 MB preview limit."
+                                                .to_owned(),
+                                        ),
+                                        warnings: Vec::new(),
+                                        truncated,
+                                    }
+                                } else if request.render_document {
+                                    let cancellation = cancellation_for_task.clone();
+                                    let parsed = gio::spawn_blocking(move || {
+                                        let parsed = parse_document(kind, &source, &cancellation)
+                                            .and_then(|parsed| {
+                                                layout_document(parsed.document, &cancellation)
+                                                    .map(|document| (document, parsed.warnings))
+                                            });
+                                        (source, parsed)
+                                    })
+                                    .await;
+                                    let (source, parsed) = match parsed {
+                                        Ok(parsed) => parsed,
+                                        Err(_) => {
+                                            if cancellation_for_task.is_cancelled() {
+                                                return;
+                                            }
+                                            emit(PreviewEvent::Failed {
+                                                request_id,
+                                                entry,
+                                                message: "The preview worker stopped unexpectedly."
+                                                    .to_owned(),
+                                            });
+                                            return;
+                                        }
+                                    };
+                                    if cancellation_for_task.is_cancelled() {
+                                        return;
+                                    }
+                                    match parsed {
+                                        Ok((document, warnings)) => PreviewContent::Document {
+                                            source,
+                                            document: Some(document),
+                                            fallback_reason: None,
+                                            warnings,
+                                            truncated,
+                                        },
+                                        Err(reason) => PreviewContent::Document {
+                                            source,
+                                            document: None,
+                                            fallback_reason: Some(reason),
+                                            warnings: Vec::new(),
+                                            truncated,
+                                        },
+                                    }
+                                } else {
+                                    PreviewContent::Document {
+                                        source,
+                                        document: None,
+                                        fallback_reason: None,
+                                        warnings: Vec::new(),
+                                        truncated,
+                                    }
+                                }
+                            } else {
+                                PreviewContent::Text {
+                                    content: source,
+                                    truncated,
+                                }
+                            }
+                        }
                         Err(error) => {
                             emit(PreviewEvent::Failed {
                                 request_id,
@@ -335,6 +631,9 @@ impl PreviewProvider for LocalPreviewProvider {
                     };
             }
 
+            if cancellation_for_task.is_cancelled() {
+                return;
+            }
             emit(PreviewEvent::Ready(Preview {
                 request_id,
                 entry,
@@ -345,30 +644,15 @@ impl PreviewProvider for LocalPreviewProvider {
 
         LoadHandle::new(move || {
             cancellation.cancel();
-            task.abort();
+            if abort_safe.get() {
+                task.abort();
+            }
         })
     }
 }
 
-fn uses_shared_thumbnail(operation: ParseOperation, pdf_page: i32) -> bool {
-    operation == ParseOperation::PreviewImage
-        || (operation == ParseOperation::PreviewPdf && pdf_page == 0)
-}
-
-fn full_render_settle_delay(has_placeholder: bool) -> Duration {
-    if has_placeholder {
-        PROGRESSIVE_RENDER_SETTLE_DELAY
-    } else {
-        Duration::ZERO
-    }
-}
-
-async fn wait_for_full_render(has_placeholder: bool, cancellation: &Cancellation) -> bool {
-    let settle_delay = full_render_settle_delay(has_placeholder);
-    if !settle_delay.is_zero() {
-        glib::timeout_future(settle_delay).await;
-    }
-    !cancellation.is_cancelled()
+fn pdf_render_size(viewport: MediaPreviewSize) -> PdfRenderSize {
+    PdfRenderSize::for_viewport_width(viewport.width)
 }
 
 async fn read_text(
@@ -388,7 +672,7 @@ async fn read_text(
                 .map_err(|e| glib::Error::new(gio::IOErrorEnum::Failed, &e.to_string()))?;
             let truncated = bytes.len() > byte_limit;
             let sample = &bytes[..bytes.len().min(byte_limit)];
-            Ok((String::from_utf8_lossy(sample).into_owned(), truncated))
+            Ok((decode_text_sample(sample), truncated))
         })
         .await;
         match result {
@@ -408,7 +692,11 @@ async fn read_text(
     let bytes = bytes.as_ref();
     let truncated = bytes.len() > byte_limit;
     let sample = &bytes[..bytes.len().min(byte_limit)];
-    Ok((String::from_utf8_lossy(sample).into_owned(), truncated))
+    Ok((decode_text_sample(sample), truncated))
+}
+
+fn decode_text_sample(sample: &[u8]) -> String {
+    normalize_preview_text(&String::from_utf8_lossy(sample)).into_owned()
 }
 
 #[cfg(test)]

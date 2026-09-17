@@ -45,6 +45,70 @@ impl SearchFixture {
     }
 }
 
+#[test]
+fn visit_recorder_commits_only_completed_new_navigation() {
+    let path = Location::local("/work/project");
+    let mut recorder = VisitRecorder::default();
+    assert!(
+        recorder
+            .handle(&BrowserEvent::ColumnAdded {
+                depth: 0,
+                location: path.clone(),
+            })
+            .is_none()
+    );
+    assert_eq!(
+        recorder.handle(&BrowserEvent::LoadFinished {
+            depth: 0,
+            truncated: false,
+        }),
+        Some(std::path::PathBuf::from("/work/project"))
+    );
+    assert!(
+        recorder
+            .handle(&BrowserEvent::LoadFinished {
+                depth: 0,
+                truncated: false,
+            })
+            .is_none()
+    );
+}
+
+#[test]
+fn visit_recorder_discards_superseded_navigation_and_records_successful_retries() {
+    let mut recorder = VisitRecorder::default();
+    for (depth, path) in [(0, "/work"), (1, "/work/project")] {
+        recorder.handle(&BrowserEvent::ColumnAdded {
+            depth,
+            location: Location::local(path),
+        });
+    }
+    recorder.handle(&BrowserEvent::ColumnsTruncated { len: 1 });
+    assert!(
+        recorder
+            .handle(&BrowserEvent::LoadFinished {
+                depth: 1,
+                truncated: false,
+            })
+            .is_none()
+    );
+    assert!(
+        recorder
+            .handle(&BrowserEvent::LoadFailed {
+                depth: 0,
+                message: "unavailable".into(),
+            })
+            .is_none()
+    );
+    assert_eq!(
+        recorder.handle(&BrowserEvent::LoadFinished {
+            depth: 0,
+            truncated: false,
+        }),
+        Some(std::path::PathBuf::from("/work"))
+    );
+}
+
 fn indexed_items(root: &std::path::Path) -> Vec<SearchItem> {
     let (handle, receiver) = index_trees(vec![root.to_path_buf()], false);
     handle.query("fixture");
@@ -61,6 +125,44 @@ fn indexed_items(root: &std::path::Path) -> Vec<SearchItem> {
             return items;
         }
     }
+}
+
+#[test]
+fn same_folder_search_preview_follows_focus_after_deletion() {
+    gtk_test(
+        "ui::window::composition::search::tests::same_folder_search_preview_follows_focus_after_deletion",
+        || {
+            let root = tempfile::tempdir().expect("fixture directory");
+            let path = root.path().join("fixture.txt");
+            std::fs::write(&path, "preview fixture").expect("fixture file");
+            std::fs::write(root.path().join("remaining.txt"), "remaining").expect("remaining file");
+            let file = indexed_items(root.path()).remove(0);
+            let preferences = ThemeManager::shared();
+            preferences.set_search_open_files_directly(false);
+            let fixture = SearchFixture::new(&preferences);
+            fixture.browser.navigate(Location::local(root.path()));
+            crate::ui::media::tests::wait(|| {
+                fixture
+                    .browser
+                    .column_snapshot(0)
+                    .is_some_and(|s| !s.loading)
+            });
+            fixture.events.borrow_mut().clear();
+            activate_result(&fixture.browser, &fixture.preview, &preferences, file);
+            assert!(fixture.events.borrow().is_empty());
+            assert!(fixture.preview.is_open());
+            std::fs::remove_file(&path).expect("remove previewed file");
+            crate::ui::media::tests::wait(|| {
+                fixture
+                    .browser
+                    .column_snapshot(0)
+                    .is_some_and(|s| s.count == 1 && s.selected_positions == [0])
+            });
+            assert!(fixture.preview.is_open());
+            assert!(fixture.events.borrow().is_empty());
+            fixture.browser.clear_observer();
+        },
+    );
 }
 
 #[test]
